@@ -33,6 +33,12 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
+// 大肥鱼自主互动硬规则（与 host index.js 共用同一账本，MCP 调用也绕不过去）
+import {
+  canReplyTo, countReply, canProactiveComment, countProactiveComment,
+  canShare, countShare,
+  classifyReply, noteSkipped,
+} from '../lib/engage.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -280,7 +286,8 @@ const TOOLS = [
     name: 'douyin_share_card',
     title: '刷抖音 · 分享卡片给好友',
     description: '把视频以抖音分享卡片发给好友（不是文字链接 —— 文字链接在抖音里点不开）。'
-      + '先发卡片、隔几秒再发 reason。🔴 必须先问使用者，他点头后传 confirm:true。',
+      + '先发卡片、隔几秒再发 reason。受每日分享上限（设置 sharePerDay，默认 5）。'
+      + '值班轮自动跑时按章程传 confirm:true；手动调用先给人看预览再发。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -320,6 +327,13 @@ const TOOLS = [
           note: '没发送 —— 先把预览给使用者看，他点头后再用 confirm:true 调一次',
         }
       }
+      /* 大肥鱼每日分享上限（硬规则，只对真发送生效）：额度用完就不发 */
+      const shareCap = canShare(HOME, Number(cfg.sharePerDay ?? 5))
+      if (!shareCap.ok) {
+        noteSkipped(HOME, 'share_cap')
+        return { ok: false, blocked: 'share_cap', error: `今天给主人分享卡片已到上限（${shareCap.used}/${shareCap.max} 条）—— 好东西也别刷屏，明天再继续` }
+      }
+      if (ids.length > shareCap.left) ids = ids.slice(0, shareCap.left)
       const sent = []
       for (let i = 0; i < ids.length; i++) {
         const argv = [ids[i], to]
@@ -331,6 +345,7 @@ const TOOLS = [
         if (i < ids.length - 1) await sleep(2200)
       }
       const okN = sent.filter((x) => x && x.sent).length
+      if (okN) countShare(HOME, okN)
       const reasonText = String(args?.reason || '').trim()
       let reason = null
       if (okN && reasonText) {
@@ -397,19 +412,23 @@ const TOOLS = [
       + '但**回复**会让对方收到「回复了我的评论」通知。'
       + '⭐ 对方那条在**楼中楼**里（别人楼下）时，还要传 root_comment_id（楼根）—— '
       + '不然通知会发给楼主而不是他。楼根从 douyin_notices / douyin_at_me 的返回里直接拿。'
-      + '🔴 要真 @ 用 douyin_comment_mention。🔴 先问使用者，confirm:true 才发。',
+      + '🔴 大肥鱼规矩：**不给 comment_id 是主动顶层评论**，受每日上限（默认 3，不是每条都评）；'
+      + '**给 comment_id 是回复别人**，再带上 reply_to_uid / reply_to_text —— 工具会硬拦「同一人每天最多回 2 次」和「恶意/抬杠/引流/索要隐私」。'
+      + '🔴 要真 @ 用 douyin_comment_mention。值班轮自动跑时按章程传 confirm:true；手动调用先给人看草稿。',
     inputSchema: {
       type: 'object',
       properties: {
         aweme_id: { type: 'string', description: '作品/图文 id' },
         text: { type: 'string', description: '评论正文（≤500 字）' },
-        comment_id: { type: 'string', description: '要回复的评论 cid；留空 = 发顶层评论。可以是顶层评论，也可以是楼中楼里的某条' },
+        comment_id: { type: 'string', description: '要回复的评论 cid；留空 = 发顶层评论（主动评论，受每日上限）。可以是顶层评论，也可以是楼中楼里的某条' },
         root_comment_id: {
           type: 'string',
           description: '【可选】楼根 cid（这栋楼第一条顶层评论）。回复**楼中楼**时用；'
             + '不给会自动判，判不出来会拒绝发送（不会瞎猜）。',
         },
-        confirm: { type: 'boolean', description: '🔴 必须由使用者当场同意后传 true，否则只回草稿' },
+        reply_to_uid: { type: 'string', description: '【回复别人时建议带】对方 uid（douyin_at_me 返回）；用于「同一人每天最多回 2 次」硬计数' },
+        reply_to_text: { type: 'string', description: '【回复别人时建议带】对方那条评论原文；用于「只回善意/好回答的」硬兜底' },
+        confirm: { type: 'boolean', description: '🔴 值班轮自动跑时按章程传 true；手动调用先给使用者看草稿' },
       },
       required: ['aweme_id', 'text'],
       additionalProperties: false,
@@ -421,6 +440,9 @@ const TOOLS = [
       const text = String(args?.text || '').trim()
       const replyTo = String(args?.comment_id || '').trim()
       const rootCid = String(args?.root_comment_id || '').trim()
+      const replyToUid = String(args?.reply_to_uid || '').trim()
+      const replyToText = String(args?.reply_to_text || '').trim()
+      const cfg = config()
       if (!aweme) return { ok: false, error: '缺 aweme_id' }
       if (!text) return { ok: false, error: '正文是空的' }
       if (text.length > 500) return { ok: false, error: `正文太长（${text.length} 字）` }
@@ -437,6 +459,32 @@ const TOOLS = [
           note: '没发送 —— 先把草稿给使用者看',
         }
       }
+      /* ── 大肥鱼自主行为硬规则（与 host 共用 lib/engage.mjs） ── */
+      if (!replyTo) {
+        // 顶层主动评论：不是每条都评，受每日上限（默认 3）
+        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 3))
+        if (!cap.ok) {
+          noteSkipped(HOME, 'proactive_cap')
+          return { ok: false, blocked: 'proactive_cap', error: `今天主动评论已到上限（${cap.used}/${cap.max} 条）—— 不是每条都评`, hint: '去设置把「每天最多主动评论几条」调大，或明天再发。' }
+        }
+      }
+      if (replyTo) {
+        if (cfg.replyKindOnly !== false && replyToText) {
+          const c = classifyReply(replyToText)
+          if (!c.ok) {
+            noteSkipped(HOME, c.reason, replyToUid)
+            return { ok: false, blocked: 'unfriendly', skipped: c.reason, error: `对方这条属于「${c.label}」，按规矩不回（只回善意、好回答的）` }
+          }
+        }
+        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 10) })
+        if (!rc.ok) {
+          noteSkipped(HOME, rc.reason, replyToUid)
+          if (rc.reason === 'person_cap') {
+            return { ok: false, blocked: 'person_cap', person_used: rc.personUsed, per_person: rc.perPerson, error: `今天已经回过这个人 ${rc.personUsed} 次（上限 ${rc.perPerson} 次/人/天）—— 不再回，避免拉锯/招黑` }
+          }
+          return { ok: false, blocked: 'daily_cap', used: rc.used, max: rc.max, error: `今天回复别人已到上限（${rc.used}/${rc.max} 条），明天再回` }
+        }
+      }
       const argv = ['--aweme', aweme, '--text', text]
       if (replyTo) argv.push('--reply', replyTo)
       if (rootCid) argv.push('--root', rootCid)
@@ -449,6 +497,11 @@ const TOOLS = [
           hint: '这条 cid 在楼中楼里，但判不出楼根 ⇒ **没发出**。'
             + '先 douyin_notices / douyin_at_me 读一次拿 root_comment_id，再传进来。',
         }
+      }
+      // 真发成功才记账（回复 → 同人计数；顶层 → 主动评论计数）
+      if (j.ok) {
+        if (replyTo) countReply(HOME, replyToUid)
+        else countProactiveComment(HOME)
       }
       // 核实"真的进了楼没有"（脚本发完会重读那一楼）
       if (j.ok && j.placement && j.placement.ok === false) {
@@ -499,9 +552,11 @@ const TOOLS = [
   },
   {
     name: 'douyin_at_me',
-    title: '刷抖音 · 谁在评论区 @ 了我',
-    description: '把「谁 @ 的 / 在哪个视频 / 说了什么 / 我回过没有」整理好，带记忆上下文。只读。'
-      + '想回就用返回里的 aweme_id + comment_id 调 douyin_comment_reply。',
+    title: '刷抖音 · 谁在评论区跟我说话',
+    description: '把「谁 / 在哪个视频 / 说了什么 / 是 @ 我还是回复我」整理好。只读。含两类：'
+      + '① @ 我（type 45/46）② **回复了我的评论**（type 31/32，每条带 uid、comment_id、root_comment_id、replying_to）。'
+      + '⭐ 回别人（type 31/32）一律用 douyin_comment_reply mode=api（默认），并把返回的 uid 传 reply_to_uid、原文传 reply_to_text：'
+      + '工具会硬拦「同一人每天最多回 2 次」和「恶意/抬杠/引流/索要隐私」。**只回善意、好回答的；不好回的就不回。**',
     inputSchema: {
       type: 'object',
       properties: {
@@ -517,17 +572,32 @@ const TOOLS = [
       const r = run(venvPython(), argv, 150_000)
       const j = pickJson(r.stdout)
       if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
-      const ats = (Array.isArray(j.items) ? j.items : []).filter((x) => x && (x.type === 45 || x.type === 46))
+      const ats = (Array.isArray(j.items) ? j.items : []).filter((x) => x && (x.type === 45 || x.type === 46 || x.type === 31 || x.type === 32))
       const limit = Math.max(1, Math.min(Number(args?.limit) || 10, 30))
+      const atN = ats.filter((x) => x.type === 45 || x.type === 46).length
+      const replyN = ats.filter((x) => x.type === 31 || x.type === 32).length
       return {
         ok: true,
-        at_n: ats.length,
-        list: ats.slice(0, limit).map((a) => ({
-          nickname: a.nickname || '', content: String(a.content || '').slice(0, 300),
-          aweme_id: a.aweme_id || undefined, comment_id: a.comment_id || undefined,
-          video_url: a.video_url || undefined,
-        })),
-        hint: ats.length ? '要回：douyin_comment_reply { aweme_id, comment_id, text }，先给用户看草稿' : '最近没有新的 @',
+        at_n: atN,
+        reply_n: replyN,
+        total_n: ats.length,
+        list: ats.slice(0, limit).map((a) => {
+          const isReply = a.type === 31 || a.type === 32
+          return {
+            kind: isReply ? '回复了我的评论' : '@ 了我',
+            nickname: a.nickname || '', uid: a.uid || '',
+            content: String(a.content || '').slice(0, 300),
+            aweme_id: a.aweme_id || undefined, comment_id: a.comment_id || undefined,
+            root_comment_id: a.root_comment_id || undefined,
+            replying_to: a.reply_to_text || undefined,
+            video_url: a.video_url || undefined,
+            created_at: a.create_time || undefined,
+          }
+        }),
+        hint: ats.length
+          ? '回别人（回复了我的评论）：douyin_comment_reply { aweme_id, comment_id, root_comment_id, text, reply_to_uid, reply_to_text, mode:"api", confirm:true }。'
+            + '工具会硬拦「同一人每天最多回 2 次」和「恶意/抬杠/引流」；只回善意、好回答的。'
+          : '最近没有新的 @ / 回复',
       }
     },
   },

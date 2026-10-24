@@ -11,7 +11,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { findBrowser } from './lib/chrome.mjs'
 
@@ -29,7 +29,7 @@ console.log('1. 文件清单')
 const required = [
   'package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'requirements.txt',
   'lib/hostdeps.mjs', 'lib/state.mjs', 'lib/credential.mjs', 'lib/notify.mjs', 'lib/toast.mjs', 'lib/uvfetch.mjs',
-  'lib/paths.mjs', 'lib/chrome.mjs',
+  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs',
   'prompts/duty.md', 'prompts/persona.default.md', 'prompts/sample-candidates.json',
   // 给别的 AI / MCP 用的那一层
   'AI-USAGE.md', 'tools/mcp-server.mjs', 'tools/doctor.mjs', 'check-client.mjs',
@@ -1074,6 +1074,71 @@ try {
     } else bad(`通知解析失败：${JSON.stringify(j).slice(0, 200)}`)
   } catch (e) { bad(`通知解析测试失败：${e.message}`) }
 } catch (e) { bad(`自动发送/跑一轮检查失败：${e.message}`) }
+
+/* ── 4p. 大肥鱼自主行为（2026-10-24）：自己刷/学习/主动评论/善意回复/同人≤2 ── */
+console.log('\n4p. 大肥鱼自主行为（学习 / 分享 / 主动评论 / 善意回复）')
+try {
+  const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  const mcp = readFileSync(join(here, 'tools', 'mcp-server.mjs'), 'utf8')
+  const cl = readFileSync(join(here, 'client.js'), 'utf8')
+  const engagePath = join(here, 'lib', 'engage.mjs')
+
+  // ① 硬规则必须 host 与 MCP 双落地（值班轮实际走 MCP，只在一处写会被绕过）
+  if (/from '\.\/lib\/engage\.mjs'/.test(idx)) ok('host index.js 引用 lib/engage.mjs')
+  else bad('host 没引用 engage —— 交互轮的硬规则缺失')
+  if (/from '\.\.\/lib\/engage\.mjs'/.test(mcp)) ok('MCP server 引用 lib/engage.mjs（值班轮绕不过去）')
+  else bad('MCP 没引用 engage —— 值班轮实际走 MCP，硬规则会被绕过')
+  if (/from '\.\/lib\/tastes\.mjs'/.test(idx)) ok('host 引用 lib/tastes.mjs（口味画像）')
+  else bad('host 没引用 tastes.mjs')
+
+  // ② 配置默认值：私密分享默认开，公开行为默认关，同人默认 2，善意过滤默认开
+  const cfgRe = [
+    ['shareToOwner', 'shareToOwner:\\s*z\\.boolean\\(\\)\\.default\\(true\\)', '分享给主人默认开'],
+    ['proactiveComment', 'proactiveComment:\\s*z\\.boolean\\(\\)\\.default\\(false\\)', '主动评论默认关（保守档）'],
+    ['autoReply', 'autoReply:\\s*z\\.boolean\\(\\)\\.default\\(false\\)', '自动回复默认关（保守档）'],
+    ['replyPerPerson', 'replyPerPerson:\\s*z\\.natural\\(\\)\\.default\\(2\\)', '同一人每天最多回 2 次（默认）'],
+    ['replyKindOnly', 'replyKindOnly:\\s*z\\.boolean\\(\\)\\.default\\(true\\)', '善意过滤默认开'],
+  ]
+  for (const [, re, label] of cfgRe) { if (new RegExp(re).test(idx)) ok(label); else bad(label + ' —— 配置默认值不对') }
+
+  // ③ MCP 评论工具接回复入参 + host/MCP 都硬卡
+  if (/reply_to_uid/.test(mcp) && /reply_to_text/.test(mcp)) ok('MCP 评论工具接 reply_to_uid / reply_to_text')
+  else bad('MCP 评论工具缺回复入参，同人计数/善意兜底落不了')
+  for (const [name, src] of [['MCP', mcp], ['host', idx]]) {
+    if (/person_cap/.test(src) && /proactive_cap/.test(src) && /unfriendly/.test(src))
+      ok(`${name} 硬卡 person_cap / proactive_cap / unfriendly`)
+    else bad(`${name} 缺主动评论/同人/善意的硬卡`)
+  }
+  if (/share_cap/.test(mcp)) ok('MCP 分享卡片有每日上限（share_cap）')
+  else bad('MCP 分享没有 share_cap')
+
+  // ④ MCP at_me 能读到「回复了我的评论」（type 31/32）并给 reply_n
+  if (/x\.type === 31/.test(mcp) && /reply_n/.test(mcp)) ok('MCP douyin_at_me 读得到回复类（type31/32）并给 reply_n')
+  else bad('MCP at_me 不读回复类，自动回复没有来源')
+
+  // ⑤ 面板有自主行为卡；值班提示词注入口味画像
+  if (/大肥鱼自主行为/.test(cl) && /proactiveComment/.test(cl) && /replyPerPerson/.test(cl))
+    ok('面板有「大肥鱼自主行为」卡（开关 + 上限）')
+  else bad('面板缺大肥鱼自主行为卡')
+  if (/tasteProfileText/.test(idx) && /口味画像/.test(idx)) ok('值班提示词注入「口味画像」（学习闭环）')
+  else bad('提示词没注入口味画像，自主学习不闭环')
+
+  // ⑥ 真实跑一遍 lib/engage：同人第 3 次必须拦、善意放行、引流拦截
+  const engageUrl = pathToFileURL(engagePath).href
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import {canReplyTo,countReply,classifyReply} from ${JSON.stringify(engageUrl)};`
+    + `import {mkdtempSync} from 'node:fs'; import {tmpdir} from 'node:os'; import {join} from 'node:path';`
+    + `const d=mkdtempSync(join(tmpdir(),'eng-')); const o={perPerson:2,perDay:10};`
+    + `const first=canReplyTo(d,'u1',o).ok; countReply(d,'u1'); countReply(d,'u1');`
+    + `const third=canReplyTo(d,'u1',o);`
+    + `const fr=classifyReply('哈哈这条笑死我了').ok; const ho=classifyReply('加我微信 vx123 发资源').ok;`
+    + `console.log(JSON.stringify({first,thirdBlocked:third.ok===false&&third.reason==='person_cap',friendly:fr,hostileBlocked:ho===false}))`,
+  ], { encoding: 'utf8', timeout: 30_000 })
+  let ej = {}; try { ej = JSON.parse(String(r.stdout || '').trim()) } catch { /* 解析失败走下面 bad */ }
+  if (ej.first && ej.thirdBlocked && ej.friendly && ej.hostileBlocked)
+    ok('lib/engage 行为正确：同人第 3 次拦截(person_cap)、善意放行、引流拦截')
+  else bad(`lib/engage 行为不符：${String(r.stdout || r.stderr || '').slice(0, 200)}`)
+} catch (e) { bad(`大肥鱼自主行为检查失败：${e.message}`) }
 
 /* ── 4e. 采集门槛 / 跨天记账 ── */
 console.log('\n4e. 采集门槛 / 跨天')

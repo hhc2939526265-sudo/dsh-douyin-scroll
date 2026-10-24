@@ -80,7 +80,7 @@ node "<插件目录>/tools/mcp-server.mjs"
 |---|---|
 | `douyin_share_card` | 发**分享卡片**（不是文字链接）给好友，可带一句 reason |
 | `douyin_dm` | 发一条私信 |
-| `douyin_comment_reply` | 发评论 / 回复某条评论。**`mode:"api"`（默认）直接回复楼层；`mode:"ui"` 真 @ 顶层**。回楼中楼要额外传 `root_comment_id`（楼根，通知才发给对方而不是楼主） |
+| `douyin_comment_reply` | 发评论 / 回复某条评论。**`mode:"api"`（默认）直接回复楼层；`mode:"ui"` 真 @ 顶层**。回楼中楼要额外传 `root_comment_id`（楼根，通知才发给对方而不是楼主）。⭐ **不传 comment_id = 主动顶层评论**（受每日上限）；**回复别人**再传 `reply_to_uid`（同人每天≤2 次）+ `reply_to_text`（对方原文，恶意/抬杠/引流会被拦） |
 | `douyin_comment_mention` | 同上，等价于 `mode:"ui"` 的便捷入口（真 @、UI 点选）—— 2026-10-23 新增 |
 
 ### ⭐⭐ 该用哪个：**有评论可回就回复，没评论可回才 @**（2026-10-23 定稿）
@@ -95,6 +95,22 @@ node "<插件目录>/tools/mcp-server.mjs"
 
 ⚠️ 曾经以为「顶层评论能让所有人看到，所以某些场景要用 @」——
 **这个场景不存在**：本插件是给一个人用的，「公开」不是目的，只是抖音没有「只通知一个人」的顶层评论这个事实带来的副作用。
+
+### ⭐⭐ 大肥鱼自主行为：硬规则（2026-10-24，工具层强卡，绕不过去）
+
+这是一只**自己刷、自己学、自己表达**的小号。值班轮自动跑时在开关与上限内直接发
+（工具带 `confirm:true`）；手动调用仍先给草稿。硬规则由 `lib/engage.mjs` 统一记账：
+
+- **主动评论**（`douyin_comment_reply` 不传 `comment_id`，顶层普通评论）：每天 ≤ `proactiveCommentPerDay`
+  （默认 3），**不是每条都评**；超限返回 `blocked:"proactive_cap"`。
+- **分享卡片**（`douyin_share_card`）：每天 ≤ `sharePerDay`（默认 5）；超限 `blocked:"share_cap"`。
+- **回复别人**（传了 `comment_id`）：
+  - 必须再传 `reply_to_uid`（对方 uid）+ `reply_to_text`（对方那条原文）。
+  - 🔴 **同一个人每天最多回 2 次**（`replyPerPerson`，自然日计数），超了 `blocked:"person_cap"`，别硬试。
+  - 每天总回复 ≤ `replyPerDay`（默认 10），超了 `blocked:"daily_cap"`。
+  - 🔴 `reply_to_text` 被判为恶意 / 辱骂 / 抬杠 / 引战 / 引流广告 / 索要隐私 / 无意义时，
+    `blocked:"unfriendly"`，**这类一律不回**（只回善意、好回答的）。
+- 被拦的回复会自动标记已读，不会反复弹出来。
 
 ### ⭐⭐ 别人**再回一句**的时候，回法不一样（2026-10-23 实测定稿）
 

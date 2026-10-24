@@ -26,6 +26,8 @@ reason.txt
 round-evidence.json
 forward-pick.json
 forward-msg.txt
+engage.json
+tastes-inbox.jsonl
 *.log
 
 chrome-profile/

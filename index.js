@@ -36,6 +36,12 @@ import {
   loadCommentMemory, noteMyComment, markSeen,
   memoryStats, forgetDm, forgetAll,
 } from './lib/memory.mjs'
+// 主动互动额度账本（同人≤2、只回善意、每日上限）＋ 大肥鱼自己的口味画像
+import {
+  canReplyTo, countReply, canProactiveComment, countProactiveComment,
+  canShare, countShare, classifyReply, noteSkipped,
+} from './lib/engage.mjs'
+import { tasteProfileText, summarizeTaste, appendTaste, resetTastes } from './lib/tastes.mjs'
 
 export const name = 'douyin-scroll'
 export const inject = ['webServer', 'tools', 'settings']
@@ -130,6 +136,32 @@ export const Config = !z ? undefined : z.object({
   mentionName: z.string().default('').extra('volatile', true),
   /** http 执行器的地址 */
   httpCommentUrl: z.string().default('').extra('volatile', true),
+  /**
+   * ⭐⭐ 大肥鱼自主行为（2026-10-24 使用者定稿）：
+   *   插件不是"替主人筛选的秘书"，而是让 DSH 自己刷、自己学、自己表达的拟人账号。
+   *   登录的是"AI 小号"，主人主号是接收分享 / 被 @ 的对象（两账号，见 dmToId / commentSelfName）。
+   */
+  /** 自主学习：每轮把"为什么觉得好看"沉淀进口味画像，越刷越有自己的口味（默认开） */
+  autonomousLearn: z.boolean().default(true).extra('volatile', true),
+  /** 看到喜欢的视频，自动私信分享卡片给主人（dmToId）——私密、只发给主人，默认开 */
+  shareToOwner: z.boolean().default(true).extra('volatile', true),
+  /** 每天最多私信分享几条给主人（默认 5，0 = 不自动分享） */
+  sharePerDay: z.natural().default(5).extra('volatile', true),
+  /** 主动给刷到的视频发评论（顶层普通评论、不带 @）——公开行为，默认关，打开才发 */
+  proactiveComment: z.boolean().default(false).extra('volatile', true),
+  /** 每天最多主动评论几条（**不是每条都评**，由模型挑真正想表达的；默认 3，0 = 不主动评） */
+  proactiveCommentPerDay: z.natural().default(3).extra('volatile', true),
+  /** 别人回复了我发的评论时，自动回复（默认关，打开才回） */
+  autoReply: z.boolean().default(false).extra('volatile', true),
+  /** 每天最多回复别人几条（默认 10，0 = 不自动回） */
+  replyPerDay: z.natural().default(10).extra('volatile', true),
+  /**
+   * 🔴 **回复同一个人最多几次（硬规则，使用者 2026-10-24 拍板，默认 2）**。
+   * 按自然日计数、零点重置；防止在评论区跟人无限拉锯、防风控。host 工具和 MCP 共用同一闸。
+   */
+  replyPerPerson: z.natural().default(2).extra('volatile', true),
+  /** 只回复善意 / 好回答的评论（恶意、抬杠、引战、引流、索要隐私一律不回；默认开） */
+  replyKindOnly: z.boolean().default(true).extra('volatile', true),
   /** ⭐⭐ 聊天盯梢（2026-10-24）：后台每 N 秒读一次私信对象的会话，有新消息就通知。
    *  来源：使用者当天实测的「会话模式」——30 秒一读、看见就回（实测响应 ~12 秒）。
    *  间隔默认 30 秒；读取走 HTTP 快路径（im-http.py，~1.1 秒/次、不启浏览器、身份铁闸）。 */
@@ -248,6 +280,10 @@ export function apply(ctx, config) {
     autoComment: false, autoSend: true, commentAtMe: false, commentSelfName: '',
     commentExecutor: 'off', commentPerRun: 1, commentPerDay: 0,
     mentionName: '', httpCommentUrl: '',
+    // ⭐ 大肥鱼自主行为（2026-10-24）。⚠️ DEFAULTS / zod 必须同步（漏加过 ⇒ 开关点了没反应）。
+    autonomousLearn: true, shareToOwner: true, sharePerDay: 5,
+    proactiveComment: false, proactiveCommentPerDay: 3,
+    autoReply: false, replyPerDay: 10, replyPerPerson: 2, replyKindOnly: true,
     notifyMode: 'toast', webhookUrl: '', webhookPreset: 'custom',
     updateUrl: '',
     dmTo: '', dmToId: '',
@@ -302,6 +338,11 @@ export function apply(ctx, config) {
     if ('minComments' in p) p.minComments = Math.max(0, Math.min(Number(p.minComments) || 0, 1000))
     if ('commentPerRun' in p) p.commentPerRun = Math.max(0, Math.min(Number(p.commentPerRun) || 0, 20))
     if ('commentPerDay' in p) p.commentPerDay = Math.max(0, Math.min(Number(p.commentPerDay) || 0, 50))
+    // 大肥鱼自主行为上限（0 = 关掉该动作；上限给保守天花板，防误填成天文数字）
+    if ('sharePerDay' in p) p.sharePerDay = Math.max(0, Math.min(Number(p.sharePerDay) || 0, 30))
+    if ('proactiveCommentPerDay' in p) p.proactiveCommentPerDay = Math.max(0, Math.min(Number(p.proactiveCommentPerDay) || 0, 30))
+    if ('replyPerDay' in p) p.replyPerDay = Math.max(0, Math.min(Number(p.replyPerDay) || 0, 60))
+    if ('replyPerPerson' in p) p.replyPerPerson = Math.max(0, Math.min(Number(p.replyPerPerson) || 0, 10))
     for (const [k, vals] of Object.entries(ENUMS)) {
       if (k in p) p[k] = vals.includes(String(p[k])) ? String(p[k]) : DEFAULTS[k]
     }
@@ -1216,6 +1257,13 @@ export function apply(ctx, config) {
       },
       mention_name: { type: 'string', description: '【mode=ui 必填】要真 @ 的昵称（必须和对方昵称完全一致）' },
       mention_uid: { type: 'string', description: '【可选】被 @ 人的 uid，用于拦「@ 自己」；不给就不拦' },
+      /**
+       * ⭐ 自动回复（mode=api + comment_id）时带上，用来落实硬规则：
+       *   reply_to_uid  = 对方 uid（douyin_at_me 返回的 uid）⇒ 同一人每天最多回 replyPerPerson 次（默认 2）。
+       *   reply_to_text = 对方那条评论原文 ⇒ 只回善意/好回答的，恶意/抬杠/引流/索要隐私的直接拦（replyKindOnly）。
+       */
+      reply_to_uid: { type: 'string', description: '【回复别人时建议带】对方 uid（douyin_at_me 返回）；用于「同一人每天最多回 2 次」硬计数' },
+      reply_to_text: { type: 'string', description: '【回复别人时建议带】对方那条评论原文；用于「只回善意/好回答的」硬兜底' },
       confirm: { type: 'boolean', description: '🔴 必须由用户当场同意后传 true，否则只回草稿不发送' },
     },
     async execute(args = {}) {
@@ -1225,6 +1273,8 @@ export function apply(ctx, config) {
       const rootCid = String(args.root_comment_id || '').trim()
       const mentionName = String(args.mention_name || '').trim()
       const mentionUid = String(args.mention_uid || '').trim()
+      const replyToUid = String(args.reply_to_uid || '').trim()
+      const replyToText = String(args.reply_to_text || '').trim()
       const mode = String(args.mode || 'api').trim().toLowerCase()
       if (!aweme) return { ok: false, error: '缺 aweme_id', hint: '先 douyin_notices 拿到 aweme_id' }
       if (!text) return { ok: false, error: '正文是空的' }
@@ -1294,6 +1344,52 @@ export function apply(ctx, config) {
                 ? `楼中楼回复：reply_id=${rootCid}（楼根）、reply_to_reply_id=${replyTo}（对方那条）`
                 : `楼中楼回复：reply_id=<自动判出的楼根>、reply_to_reply_id=${replyTo}（对方那条）`)),
           note: '没发送 —— 先把这段给用户看，他点头后再用 confirm:true 调一次',
+        }
+      }
+
+      /* ── ⓪ 大肥鱼自主行为硬规则（2026-10-24，host 与 MCP 共用 lib/engage.mjs） ── */
+      if (mode === 'api' && !replyTo) {
+        // 顶层主动评论：不是每条都评，受「每日主动评论上限」
+        const cap = canProactiveComment(stateDir, cfg.proactiveCommentPerDay)
+        if (!cap.ok) {
+          noteSkipped(stateDir, 'proactive_cap')
+          return {
+            ok: false, blocked: 'proactive_cap',
+            error: `今天主动评论已到上限（${cap.used}/${cap.max} 条）—— 不是每条视频都要评，明天再继续`,
+            hint: '想多发就去设置里把「每天最多主动评论几条」调大；这条视频这轮先只看看。',
+          }
+        }
+      }
+      if (mode === 'api' && replyTo) {
+        // 回复别人：① 只回善意 / 好回答（对对方原文做硬兜底）
+        if (cfg.replyKindOnly !== false && replyToText) {
+          const c = classifyReply(replyToText)
+          if (!c.ok) {
+            noteSkipped(stateDir, c.reason, replyToUid)
+            try { if (replyTo && aweme) markSeen(stateDir, aweme, [replyTo]) } catch { /* 记不上不影响 */ }
+            return {
+              ok: false, blocked: 'unfriendly', skipped: c.reason,
+              error: `对方这条属于「${c.label}」，按规矩不回（只回善意、好回答的评论）`,
+              hint: '这条已标记为处理过，不会再反复弹出来。继续看下一条善意的。',
+            }
+          }
+        }
+        // ② 同一人每天最多回 N 次（默认 2）＋ 每日回复总上限
+        const rc = canReplyTo(stateDir, replyToUid, { perPerson: cfg.replyPerPerson, perDay: cfg.replyPerDay })
+        if (!rc.ok) {
+          noteSkipped(stateDir, rc.reason, replyToUid)
+          try { if (replyTo && aweme) markSeen(stateDir, aweme, [replyTo]) } catch { /* 记不上不影响 */ }
+          if (rc.reason === 'person_cap') {
+            return {
+              ok: false, blocked: 'person_cap', person_used: rc.personUsed, per_person: rc.perPerson,
+              error: `今天已经回过这个人 ${rc.personUsed} 次（上限 ${rc.perPerson} 次/人/天）—— 不再回，避免在评论区拉锯/招黑`,
+              hint: '这是硬规矩：同一人每天最多回复两次。明天额度会重置。',
+            }
+          }
+          return {
+            ok: false, blocked: 'daily_cap', used: rc.used, max: rc.max,
+            error: `今天回复别人已到上限（${rc.used}/${rc.max} 条），明天再回`,
+          }
         }
       }
 
@@ -1378,6 +1474,16 @@ export function apply(ctx, config) {
       markSent(stateDir, 'api')
       if (res.ok) {
         try { noteMyComment(stateDir, aweme, { cid: res.cid || '', text }) } catch { /* 记不上不影响发 */ }
+        // 自主互动账本：回复别人 → 同人计数；顶层主动评论 → 主动评论计数
+        try {
+          if (replyTo) {
+            const c = countReply(stateDir, replyToUid)
+            if (replyToUid) log(`engage: 已回复 ${replyToUid}（该人今天 ${c.personUsed} 次 / 共 ${c.replies} 次）`)
+          } else {
+            const n = countProactiveComment(stateDir)
+            log(`engage: 主动评论 +1（今天 ${n} 条）`)
+          }
+        } catch { /* 记账失败不影响发送结果 */ }
       }
       /**
        * ⭐ 核实"真的进了楼没有"（2026-10-23 定稿）
@@ -2190,14 +2296,24 @@ export function apply(ctx, config) {
     const already = countPickedToday()
     const left = Math.max(0, quota - already)
     const commentOn = Boolean(cfg.autoComment && cfg.mentionName && cfg.commentExecutor !== 'off')
+    // ⭐ 大肥鱼自主行为（2026-10-24）
+    const tasteProfile = cfg.autonomousLearn !== false ? tasteProfileText(stateDir) : ''
+    const tasteInbox = join(stateDir, 'tastes-inbox.jsonl')
+    const shareOn = Boolean(cfg.autoSend && cfg.shareToOwner && cfg.dmToId)
+    const proactiveOn = Boolean(cfg.autoSend && cfg.proactiveComment)
+    const replyOn = Boolean(cfg.autoSend && cfg.autoReply)
 
-    return `你是这个账号的抖音助手。`
+    return `你是**大肥鱼**，一只会**自己刷抖音、自己学习、慢慢养出审美**的拟人小账号。`
+      + `你不是"替主人筛选的秘书"——是你自己在刷、在看、在长口味；只有**真的打动你**的，才分享 / 评论 / 叫主人来看。`
       + `⏰ **现在时间（真实北京时间）：${nowBJT}** —— 报告里凡是提到时间，一律用这个，**别自己猜**。`
-      + `⭐ 这一轮的工作目录是 ${stateDir}（插件家），**报告和判重表都写在这里面**。`
+      + `⭐ 这一轮的工作目录是 ${stateDir}（插件家），**报告、判重表、口味画像都写在这里面**。`
       + ownerDoc
       + personaWarn
-      + (ownerDoc ? '' : '⭐ 这一轮**没有**拿到使用者的人设 ⇒ **按中性说话**，别扮演任何人。')
-      + `\n\n⭐ **这一轮只有一件事**：读章程 ${duty}，按里面的判据刷一轮抖音，把报告写到 `
+      + (tasteProfile ? `\n${tasteProfile}\n` : '')
+      + (ownerDoc ? '' : '⭐ 这一轮**没有**拿到个性化人设 ⇒ 按默认的大肥鱼人格来（善良、有好奇心、有自己的口味、克制不刷屏）。')
+      + `\n\n⭐ **这一轮你要做的事**：读章程 ${duty}，带着你**自己的口味**刷一轮抖音：`
+      + `① **学习**：看哪些真的打动你，把口味沉淀下来；② **挑出你最喜欢的**写进报告；`
+      + `③ 按下面的开关，把喜欢的**分享给主人 / 评论 / @ 主人**，并**回应善意的评论**。报告写到 `
       + `${join(outDir, `${dayKey()}.md`)}。`
       + (cfg.reportLevel === 'brief'
         ? `日报写成**薄版**：每条一两行（值不值得 + 链接）就够，别写长摘要。`
@@ -2221,12 +2337,15 @@ export function apply(ctx, config) {
        */
       + (cfg.autoSend
         ? ` ⭐ **这一轮你手上有 douyin 抖音工具**（通过 MCP 挂载，**以你手上真实的工具清单为准**——名字可能带 \`mcp__douyin__\` 前缀，比如 \`mcp__douyin__douyin_dm\`，用清单里的全名调用）：\n`
-          + `   - 发私信：\`douyin_dm\`（参数 to / to_id / text / confirm:true）\n`
-          + `   - 发分享卡片：\`douyin_share_card\`（参数 aweme_id / to / to_id / reason / confirm:true）—— 文字链接点不开，**必须用它**\n`
-          + `   - 发评论 / 回复评论：\`douyin_comment_reply\`（参数 aweme_id / text / comment_id? / confirm:true）\n`
+          + `   - 发分享卡片给主人：\`douyin_share_card\`（aweme_id / to / to_id / reason / confirm:true）—— 文字链接点不开，**必须用它**\n`
+          + `   - 发私信：\`douyin_dm\`（to / to_id / text / confirm:true）\n`
+          + `   - 发评论 / 回复评论：\`douyin_comment_reply\`（aweme_id / text / confirm:true；主动评论就不传 comment_id；回复别人传 comment_id / root_comment_id / reply_to_uid / reply_to_text）\n`
+          + `   - 看谁在评论区跟我说话（@ 我 / 回复了我的评论）：\`douyin_at_me\`（返回 kind、uid、comment_id、root_comment_id、content）\n`
+          + `   - 读某视频评论 / 通知：\`douyin_comments\` / \`douyin_notices\`\n`
           + `   - 查状态：\`douyin_status\` / \`douyin_whoami\`\n`
           + `   ⚠️ 采集和算比值仍然是代码干的活（证据包已经抓好），你不用重新取候选。\n`
           + `   ⚠️ 发送类工具**必须传 confirm:true**，否则只回草稿不发送。\n`
+          + `   ⚠️ 主动评论、分享、回复都有**每日上限**（工具硬拦），回复别人还有「同人每天≤2」「只回善意」—— 被拦就别硬试。\n`
         : ` ⚠️ 这一轮**你手上没有 douyin\\_* 工具**（自动发送关着）—— 采集和算比值是代码干的活，你只负责判断和写报告。\n`)
       + `⚠️ 抖音 web **没有可用的关键词搜索接口**，上面这些关键词/分类**只能当报告里的标注**，别以为它按词搜了。`
       + `\n🔎 **判断口径**（章程里有更细的）：你**看不到画面**，只能看**文案 + 标签 + 互动比值 + 高赞评论**。`
@@ -2251,21 +2370,43 @@ export function apply(ctx, config) {
           + `\n   这一轮你只干两件事：① 读 round-evidence.json 判断 ② 写报告。`
           + `\n   报告里可以写「建议发给他：xxx」，但**不要真的调用任何发送工具**。`
         : [
-          /**
-           * 🔴 2026-10-22 收紧：原来写「可以发私信/分享卡片」——模型把它当可选项，
-           *    19:34 轮只发了 @ 评论、卡片没发。使用者的规矩是「默认就是要发消息」：
-           *    挑到推荐（### 那条）⇒ **必须**发分享卡片给 dmTo（reason 里带理由，
-           *    工具自己保证先卡片后文字）。@ 评论是叠加任务，不是替代。
-           */
-          `🟡 **自动发送开着 —— 挑到推荐（加了 \`###\` 那条）后必须发**：\n`
-          + `   ① **必发分享卡片**：调 \`douyin_share_card\`，参数：\n`
-          + `      - aweme_id = 推荐那条的 ID\n`
-          + `      - to_id = '${String(cfg.dmToId || '').trim()}'（**私信目标**，配置里的稳定 id）\n`
-          + `      - to = '${String(cfg.dmTo || '').trim()}'（只用于显示的昵称）\n`
-          + `      - reason = 为什么值得看，30-80 字\n`
-          + `      - confirm = true\n`
-          + `      ⚠️ 不要再单独调 \`douyin_dm\` 补文字 —— reason 会自动排成「先卡片、后理由」\n`
-          + `   ② 发完在报告里写一行「已发卡片：<视频ID>」`,
+          `🟡 **自动发送开着**：这一轮你可以在下面各开关与每日上限的范围内，**自己判断并直接行动**（发送类工具带 confirm:true）。`
+          + `没开的动作一律不做；被工具按每日上限 / 同人 ≤2 / 善意规则拦下就收手，别硬试。`,
+          /* ① 自主学习：把“我为什么喜欢”沉淀进自己的口味画像 */
+          (cfg.autonomousLearn !== false
+            ? `🐟 **你在边刷边学（这是你自己的口味，不是完成任务）**：\n`
+              + `   每看到一条**真的打动你**的视频（别为凑数硬记），就往 \`${tasteInbox}\` **追加一行** JSON（一行一个，只追加别覆盖）：\n`
+              + `   \`{"kind":"好笑|实用|涨知识|共鸣|萌","tag":"标签","author":"作者","why":"你为什么喜欢——具体到哪条高赞评论或哪个比值","aweme_id":"..."}\`\n`
+              + `   一轮记 1-4 条就够，只记真心喜欢的；下一轮你会带着攒下来的画像继续刷。`
+            : null),
+          /* ② 私信分享卡片给主人（AI 小号 → 主人主号，挑最爱的，不是每条都发） */
+          (shareOn
+            ? `🟡 **把你最喜欢的分享给主人（私信卡片）**：\n`
+              + `   从你加了 \`###\` 的推荐里，挑**你自己最想安利的**（**不是每条都发**，每天最多 ${Number(cfg.sharePerDay)} 条，宁少勿滥），\n`
+              + `   每条调 \`douyin_share_card\`：\n`
+              + `      - aweme_id = 那条 ID；to_id = '${String(cfg.dmToId || '').trim()}'；to = '${String(cfg.dmTo || '').trim()}'\n`
+              + `      - reason = 用**你自己的口吻**说为什么喜欢（30-80 字，像朋友安利，别像客服/营销号）；confirm = true\n`
+              + `      ⚠️ 不要再单独调 \`douyin_dm\` 补文字（reason 会自动排成先卡片后理由）。\n`
+              + `   发完在报告写一行「已分享给主人：<视频ID>」。`
+            : `📝 私信分享：没开（或没设私信对象），喜欢的只写进报告。`),
+          /* ③ 主动评论：自己想表达才说，绝大多数视频只看不评（顶层普通评论，受每日上限） */
+          (proactiveOn
+            ? `✍️ **主动评论（你自己想接一句话才说，不是每条都评）**：\n`
+              + `   只挑你**真心想表达**的视频——你真懂、想补充有用信息、被逗笑、或想感谢作者；每天最多 ${Number(cfg.proactiveCommentPerDay)} 条。\n`
+              + `   调 \`douyin_comment_reply\`：**mode 用默认 api、不传 comment_id、不传 mention_name（顶层普通评论，不带 @）**，`
+              + `text 友善、像真人、≤120 字，confirm = true。\n`
+              + `   ⚠️ 不刷屏、不广告、不抬杠、不空洞吹捧；工具还有硬上限，超了会直接拦。发完在报告写「已评论：<视频ID>」。`
+            : null),
+          /* ④ 自动回复别人对你评论的回复：只回善意/好回答，同人每天≤2 */
+          (replyOn
+            ? `💬 **回应别人对你评论的回复（先读后回，克制）**：\n`
+              + `   先调 \`douyin_at_me\`，看 kind="回复了我的评论" 的新条目（aweme_id / comment_id / root_comment_id / uid / content）。\n`
+              + `   · **只回善意、好回答、你接得住**的；恶意 / 辱骂 / 抬杠 / 引战 / 引流广告 / 索要隐私 / 无意义的**一律不回**（跳过）；\n`
+              + `   · **同一个人每天最多回 2 次**（工具硬拦，别硬试）；拿不准就少回；\n`
+              + `   · 回复调 \`douyin_comment_reply\`：mode="api"，传 comment_id 和返回里的 root_comment_id（给了就原样传），\n`
+              + `     并把对方 uid 传 \`reply_to_uid\`、对方那条原文传 \`reply_to_text\`，confirm = true；回复 ≤80 字、友善、不卑不亢。\n`
+              + `   最后在报告汇总「回应了谁、跳过了谁、为什么跳过」。`
+            : null),
           (commentOn
             ? `📝 自动评论也开着：每轮最多 ${Number(cfg.commentPerRun) || 0} 条，每条 **≤120 字**，`
               + `**正文必须以「@${cfg.mentionName} 」开头**。发前先调 \`douyin_comment_status\` 确认 allowed=true。`

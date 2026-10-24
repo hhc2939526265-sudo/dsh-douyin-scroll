@@ -241,6 +241,8 @@ window.__ModuleLoader__.load({
       const [atMeDraft, setAtMeDraft] = React.useState(null)
       // 聊天盯梢间隔的输入草稿（2026-10-24）
       const [cwSecDraft, setCwSecDraft] = React.useState(null)
+      // 大肥鱼自主行为的数字上限草稿（分享/主动评论/回复/同人）{key: string}
+      const [engDraft, setEngDraft] = React.useState({})
       // dsh 入口路径（输入框草稿）—— 2026-10-23 加，见「出问题了？」卡片
       const [dshBinDraft, setDshBinDraft] = React.useState(null)
 
@@ -277,6 +279,29 @@ window.__ModuleLoader__.load({
         } catch (e) { say('保存失败：' + String((e && e.message) || e), 'warn') }
         finally { setBusy('') }
       }
+
+      /* 大肥鱼自主行为的开关行 / 数字上限行（2026-10-24） */
+      const engToggle = (key, title, sub, on, { disabled = false, onLabel = '✅ 已打开', offLabel = '已关闭' } = {}) =>
+        h('div', { 'data-dy-row': '' },
+          h('div', { 'data-dy-grow': '' },
+            h('div', { 'data-dy-title': '' }, title),
+            h('div', { 'data-dy-sub': '' }, sub)),
+          h(Switch, { on: Boolean(on), disabled, onChange: (v) => patch({ [key]: v }, v ? onLabel : offLabel) }))
+      const engNum = (key, label, min, max, done) =>
+        h('div', { 'data-dy-row': '' },
+          h('span', { 'data-dy-sub': '', style: { flex: '1' } }, label),
+          h('input', {
+            'data-dy-input': '', style: { width: '80px' }, type: 'number', min, max,
+            value: engDraft[key] !== undefined ? engDraft[key] : String(cfg[key] ?? ''),
+            onChange: (e) => setEngDraft({ ...engDraft, [key]: e.target.value }),
+          }),
+          h('button', {
+            'data-dy-mini': '', disabled: engDraft[key] === undefined || busy === 'patch',
+            onClick: async () => {
+              const n = Math.max(min, Math.min(Number(engDraft[key]) || 0, max))
+              await patch({ [key]: n }, done(n)); setEngDraft({ ...engDraft, [key]: undefined })
+            },
+          }, '保存'))
 
       const onDoctor = async () => {
         setBusy('doctor')
@@ -819,6 +844,53 @@ window.__ModuleLoader__.load({
           /* ⭐ 实时状态屏（2026-10-24 使用者要求：「我哪知道它有什么用、错在哪了」）：
            *    开着聊天模式时每 15 秒拉一次后端状态，显示几秒前看过、结果、通知弹没弹。 */
           cfg.chatWatch ? h(ChatWatchStatus, { key: 'cw-status' }) : null),
+
+        /* ── 🐟 大肥鱼自主行为（2026-10-24）：自己刷、自己学、自己表达 ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-title': '' }, '🐟 大肥鱼自主行为'),
+          h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
+            '让登录的小号自己刷、自己学习、自己表达。私密分享默认开；公开的主动评论、自动回复默认关，'
+            + '避免乱说话。所有上限都能改（数字填 0 = 关掉该动作）。'),
+          engToggle('autonomousLearn', '自主学习',
+            cfg.autonomousLearn ? '✅ 开着：把真心喜欢的视频记进口味画像，越刷越有自己的口味。' : '关着：不沉淀口味。',
+            cfg.autonomousLearn, { onLabel: '✅ 已打开自主学习', offLabel: '已关闭自主学习' }),
+
+          h('div', { style: { height: '8px' } }),
+          engToggle('shareToOwner', '① 把喜欢的私信分享给主人',
+            cfg.shareToOwner
+              ? '✅ 开着：从推荐里挑自己最想安利的发分享卡片（不是每条都发）。'
+              : '关着：喜欢的只写进报告。',
+            cfg.shareToOwner,
+            { disabled: !cfg.autoSend || !cfg.dmToId, onLabel: '✅ 已打开私信分享', offLabel: '已关闭私信分享' }),
+          !cfg.dmToId ? h('div', { 'data-dy-sub': '' }, '（先在下面「私信发给谁」选好主人主号）') : null,
+          engNum('sharePerDay', '每天最多分享给主人几条（0–30，0=关）', 0, 30, (n) => `每天最多分享 ${n} 条`),
+
+          h('div', { style: { height: '8px' } }),
+          engToggle('proactiveComment', '② 主动评论（不是每条都评）',
+            cfg.proactiveComment
+              ? '✅ 开着：只对真心想表达的视频发顶层普通评论，绝大多数只看不评。'
+              : '关着（默认，推荐）：不主动发公开评论。',
+            cfg.proactiveComment,
+            { disabled: !cfg.autoSend, onLabel: '✅ 已打开主动评论', offLabel: '已关闭主动评论' }),
+          engNum('proactiveCommentPerDay', '每天最多主动评论几条（0–30，0=关）', 0, 30, (n) => `每天最多主动评论 ${n} 条`),
+
+          h('div', { style: { height: '8px' } }),
+          engToggle('autoReply', '③ 自动回复别人对我的评论',
+            cfg.autoReply
+              ? '✅ 开着：只回善意、好回答的，同一个人每天最多回设定次数（默认 2）。'
+              : '关着（默认，推荐）：不回评论区里的人。',
+            cfg.autoReply,
+            { disabled: !cfg.autoSend, onLabel: '✅ 已打开自动回复', offLabel: '已关闭自动回复' }),
+          engNum('replyPerDay', '每天最多回复几条（0–60，0=关）', 0, 60, (n) => `每天最多回复 ${n} 条`),
+          engNum('replyPerPerson', '同一个人每天最多回几次（0–10，建议 2）', 0, 10, (n) => `同一个人每天最多回 ${n} 次`),
+          engToggle('replyKindOnly', '只回善意 / 好回答的评论',
+            cfg.replyKindOnly
+              ? '✅ 开着：恶意、辱骂、抬杠、引战、引流、索要隐私一律不回。'
+              : '⚠️ 关着：连恶意评论也可能回（不建议）。',
+            cfg.replyKindOnly,
+            { disabled: !cfg.autoSend || !cfg.autoReply, onLabel: '✅ 已开启善意过滤', offLabel: '已关闭善意过滤' }),
+          h('div', { 'data-dy-sub': '', style: { marginTop: '6px', opacity: '.78' } },
+            '④ 在评论区 @ 主人：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。')),
 
         /* ── 开始使用：三步装机 + 扫码登录 ──
          * 🔴 2026-10-22：以前这里只写一句「命令行跑 node tools/qr-login.mjs start」——
