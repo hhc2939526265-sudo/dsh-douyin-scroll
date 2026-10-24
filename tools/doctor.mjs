@@ -137,6 +137,24 @@ if (home) {
   }
 }
 
+/* ── 11. faster-whisper（v0.4.0 语音识别：完全可选，默认关） ── */
+{
+  let whisperReady = false
+  let detail = ''
+  if (home) {
+    const venvPy = join(home, '.venv', 'bin', 'python')
+    const venvPyWin = join(home, '.venv', 'Scripts', 'python.exe')
+    const py = existsSync(venvPyWin) ? venvPyWin : (existsSync(venvPy) ? venvPy : '')
+    if (py) {
+      const r = spawnSync(py, ['-c', 'import faster_whisper; print(getattr(faster_whisper, "__version__", "ok"))'], { encoding: 'utf8' })
+      if (r.status === 0) { whisperReady = true; detail = 'faster-whisper ' + (r.stdout || '').trim() }
+    }
+  }
+  if (whisperReady) row('本地语音识别 Whisper', 'ok', detail)
+  else row('本地语音识别 Whisper', 'warn', '没装（默认用官方字幕；想给无字幕视频也转写再装）',
+    '在 venv 里 pip install faster-whisper，并在设置页打开「本地 Whisper 转写」（首次会下载模型，较慢）')
+}
+
 /* ── 汇总 ── */
 const bad = items.filter((r) => r.state === 'bad')
 const warn = items.filter((r) => r.state === 'warn')

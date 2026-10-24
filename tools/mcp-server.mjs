@@ -43,6 +43,10 @@ import {
 import {
   awaitGate, markAction, recordFailure,
 } from '../lib/ratelimit.mjs'
+// ⭐ v0.4.0 表情包库：收集 + 安全审核 + 只发 approved + 每日贴纸额度（与 host 共用同一份）
+import {
+  ingestStickers, listStickers, reviewSticker, stickerStats, stickerSentToday, markStickerSent,
+} from '../lib/stickers.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -261,6 +265,8 @@ const TOOLS = [
         picked: rows.length,
         sources: picked.meta || [],
         frames: picked.frames || { on: false },
+        // ⭐ v0.4.0 台词来源统计（official_subtitle / asr / none）
+        spoken: (picked.frames && picked.frames.spoken) || { official_subtitle: 0, asr: 0, none: 0 },
         dropped: picked.dropped || {},
         list: rows.map((x) => ({
           aweme_id: x.aweme_id,
@@ -277,6 +283,9 @@ const TOOLS = [
           // ⭐ 画面证据：相对工作区（插件家）的帧路径，用 Read 打开看封面/关键帧；frames_kind=none 就只看文本
           frames: Array.isArray(x.frames) ? x.frames : [],
           frames_kind: x.frames_kind || 'none',
+          // ⭐ v0.4.0 台词：官方字幕或本地 Whisper（无则空串、kind=none/off）
+          spoken: typeof x.spoken === 'string' ? x.spoken : '',
+          spoken_kind: x.spoken_kind || 'none',
         })),
       }
     },
@@ -300,11 +309,19 @@ const TOOLS = [
       const lines = String(r.stdout || '').split('\n')
       const items = lines.filter((l) => /^\s{2}cid=|^\s{6}└ /.test(l)).map((s) => s.replace(/^\s+/, ''))
       if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr: String(r.stderr || '').slice(0, 300) }
+      // ⭐ v0.4.0 评论里看到的贴纸收进表情库（先待审，approve 才可用）
+      let stickers = { added: 0, blocked: 0, pending: 0, dup: 0 }
+      if (config().collectSticker !== false) {
+        const line = lines.find((l) => l.startsWith('STICKERS_JSON='))
+        if (line) { try { stickers = ingestStickers(HOME, JSON.parse(line.slice('STICKERS_JSON='.length))) } catch { /* 忽略坏行 */ } }
+      }
       return {
         ok: true,
         aweme_id: id,
         count: items.filter((s) => s.startsWith('cid=')).length,
         comments: items,
+        stickers,
+        stickerLibrary: stickerStats(HOME),
       }
     },
   },
@@ -641,11 +658,23 @@ const TOOLS = [
       if (!j.ok) return j
       const all = Array.isArray(j.messages) ? j.messages : []
       const limit = Math.max(1, Math.min(Number(args?.limit) || 30, 60))
+      // ⭐ v0.4.0 聊天里的表情图顺手收集（只收对方发来的，先待审、安全通过才可用）
+      let stickers = { added: 0, blocked: 0, pending: 0, dup: 0 }
+      if (cfg.collectSticker !== false) {
+        try {
+          const recs = all
+            .filter((m) => m && m.from === 'them' && typeof m.sticker === 'string' && /^https?:/.test(m.sticker))
+            .map((m) => ({ url: m.sticker, thumb: m.sticker, kind: 'gif', source: 'dm', name: '' }))
+          if (recs.length) stickers = ingestStickers(HOME, recs)
+        } catch { /* 收集失败不影响读私信 */ }
+      }
       return {
         ok: true, to: j.to, to_sec_uid: j.to_sec_uid, count: j.count,
         mine: j.mine, them: j.them, unknown: j.unknown,
         messages: all.slice(-limit),
         their_latest: all.filter((m) => m.from === 'them').slice(-3).reverse(),
+        stickers,
+        stickerLibrary: stickerStats(HOME),
       }
     },
   },
@@ -778,6 +807,158 @@ const TOOLS = [
       } catch (e) {
         return { ok: false, error: '找不到 AI-USAGE.md（插件包不完整）', detail: String(e?.message ?? e) }
       }
+    },
+  },
+  {
+    name: 'douyin_sticker_list',
+    title: '刷抖音 · 表情库',
+    description: '列大肥鱼表情库：pending（待审）/ approved（已通过、可发）/ blocked（已拦）/ all。表情都是自己收集的。新收集的先 Read 它的 thumb 图，再调 douyin_sticker_review 拍板。只读。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: 'pending / approved / blocked / all，默认 approved' },
+        tag: { type: 'string', description: '可选：只看某标签' },
+        limit: { type: 'number', description: '最多返回多少条，默认 50' },
+      },
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      const status = ['pending', 'approved', 'blocked', 'all'].includes(args?.status) ? args.status : 'approved'
+      const items = listStickers(HOME, {
+        status, tag: String(args?.tag || ''), limit: Math.max(1, Math.min(Number(args?.limit) || 50, 200)),
+      }).map((x) => ({
+        key: x.key, sticker_id: x.sticker_id, name: x.name, thumb: x.thumb, url: x.url,
+        kind: x.kind, source: x.source, tags: x.tags, status: x.status, reason: x.reason,
+        addedAt: x.addedAt, reviewedAt: x.reviewedAt, used: x.used,
+      }))
+      return { ok: true, status, count: items.length, stats: stickerStats(HOME), sentToday: stickerSentToday(HOME), items }
+    },
+  },
+  {
+    name: 'douyin_sticker_review',
+    title: '刷抖音 · 表情安全审核',
+    description: '🔴 表情包安全审核（必须先 Read 贴纸 thumb 图看过内容再调）。只有可爱/萌/抽象/搞笑/大肥鱼/治愈/萌宠这类无不良才能 approve；色情、暴力、血腥、恐怖、恶心、违法、涉政、辱骂、未成年向一律 block。这是能否发表情包的总闸。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: '贴纸 key（douyin_sticker_list 返回）' },
+        decision: { type: 'string', description: 'approved 或 blocked' },
+        tag: { type: 'string', description: 'approve 时给的标签（可爱/抽象/大肥鱼/萌宠/治愈…）' },
+        reason: { type: 'string', description: 'blocked 时一句话原因' },
+      },
+      required: ['key', 'decision'],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      const key = String(args?.key || '').trim()
+      const decision = String(args?.decision || '').trim()
+      if (!key || !['approved', 'blocked'].includes(decision)) return { ok: false, error: '缺 key 或 decision 非法' }
+      const r = reviewSticker(HOME, key, decision, String(args?.tag || ''), String(args?.reason || ''))
+      if (!r.ok) return { ok: false, error: r.error }
+      return { ok: true, ...r, stats: stickerStats(HOME) }
+    },
+  },
+  {
+    name: 'douyin_comment_sticker',
+    title: '刷抖音 · 发表情包',
+    description: '在评论区发一个平台贴纸表情（走评论 publish 原生 sticker_id，最稳）。贴纸来自自己收集且审核通过的表情库。给 comment_id 是回某条（楼中楼），不给是顶层表情评论。受风控节奏、每日上限、每日贴纸上限约束，要 confirm 才真发。自定义图片/GIF（无 sticker_id）web 评论发不了，会返回 unsupported。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        aweme_id: { type: 'string', description: '作品/图文 id' },
+        sticker_key: { type: 'string', description: '表情库贴纸 key（推荐）' },
+        sticker_id: { type: 'string', description: '或直接给平台贴纸 id（sticker_key 优先）' },
+        comment_id: { type: 'string', description: '可选：回某条评论 cid；留空 = 顶层表情评论' },
+        root_comment_id: { type: 'string', description: '可选：楼根 cid' },
+        reply_to_uid: { type: 'string', description: '回复别人时建议带：对方 uid（同人≤2）' },
+        reply_to_text: { type: 'string', description: '回复别人时建议带：对方原文（只回善意）' },
+        confirm: { type: 'boolean', description: '🔴 用户当场同意后传 true' },
+      },
+      required: ['aweme_id'],
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      const bad = needLogin() || needSetup()
+      if (bad) return bad
+      const cfg = config()
+      const aweme = String(args?.aweme_id || '').trim()
+      const skey = String(args?.sticker_key || '').trim()
+      const rawSid = String(args?.sticker_id || '').trim()
+      const replyTo = String(args?.comment_id || '').trim()
+      const rootCid = String(args?.root_comment_id || '').trim()
+      const replyToUid = String(args?.reply_to_uid || '').trim()
+      const replyToText = String(args?.reply_to_text || '').trim()
+      if (!aweme) return { ok: false, error: '缺 aweme_id' }
+      if (cfg.useSticker !== true) {
+        return { ok: false, blocked: 'sticker_disabled', error: '发表情包默认关闭。等表情库收集并审核过一些安全贴纸后，去设置页打开「允许发表情包」。' }
+      }
+      let sticker = null
+      if (skey) {
+        sticker = listStickers(HOME, { status: 'all', limit: 500 }).find((x) => x.key === skey) || null
+        if (!sticker) return { ok: false, error: '表情库里没有这个 key（先 douyin_sticker_list 看）' }
+      } else if (rawSid) {
+        sticker = listStickers(HOME, { status: 'all', limit: 500 }).find((x) => x.sticker_id === rawSid)
+          || { sticker_id: rawSid, status: 'pending', name: '' }
+      } else return { ok: false, error: '缺 sticker_key（推荐）或 sticker_id' }
+      if (cfg.stickerSafeOnly !== false && sticker.status !== 'approved') {
+        return {
+          ok: false, blocked: 'not_approved', status: sticker.status,
+          error: sticker.status === 'blocked' ? '这张表情审核没过（含不良/不适），不能发'
+            : '这张表情还没审核：先 Read thumb，用 douyin_sticker_review 判定 approve 才能发',
+        }
+      }
+      if (!sticker.sticker_id) {
+        return { ok: false, unsupported: 'custom_image_comment', error: '自定义图片/GIF（无平台 sticker_id）web 评论发不了；平台贴纸才走这条。' }
+      }
+      const perDay = Math.max(0, Number(cfg.stickerPerDay ?? 5) || 0)
+      const usedToday = stickerSentToday(HOME)
+      if (perDay === 0) return { ok: false, blocked: 'sticker_cap', error: '每日贴纸额度为 0' }
+      if (usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
+      if (!replyTo) {
+        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 3))
+        if (!cap.ok) return { ok: false, blocked: 'proactive_cap', error: `今天主动评论（含表情）已到上限（${cap.used}/${cap.max}），明天再继续` }
+      } else {
+        if (cfg.replyKindOnly !== false && replyToText) {
+          const c = classifyReply(replyToText)
+          if (!c.ok) { noteSkipped(HOME, c.reason, replyToUid); return { ok: false, blocked: 'unfriendly', skipped: c.reason, error: `对方这条属于「${c.label}」，按规矩不发表情回` } }
+        }
+        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 10) })
+        if (!rc.ok) {
+          noteSkipped(HOME, rc.reason, replyToUid)
+          if (rc.reason === 'person_cap') return { ok: false, blocked: 'person_cap', error: `今天已回过这个人 ${rc.personUsed} 次（上限 ${rc.perPerson}），不再发表情回` }
+          return { ok: false, blocked: 'daily_cap', error: `今天回复已到上限（${rc.used}/${rc.max}），明天再回` }
+        }
+      }
+      if (args?.confirm !== true) {
+        return {
+          ok: true, sent: false, needsConfirm: true, aweme_id: aweme, comment_id: replyTo || '(顶层表情评论)',
+          sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name, tags: sticker.tags, thumb: sticker.thumb },
+          quota: { stickerToday: `${usedToday}/${perDay}` },
+          note: '没发送 —— 确认合适、没认错视频后用 confirm:true 再调一次。',
+        }
+      }
+      const rlKind = replyTo ? 'reply' : 'comment'
+      const gate = await awaitGate(HOME, rlKind, rateOpts())
+      if (!gate.ok) return rateBlocked(gate)
+      const argv = ['--aweme', aweme, '--sticker', String(sticker.sticker_id)]
+      if (replyTo) argv.push('--reply', replyTo)
+      if (rootCid) argv.push('--root', rootCid)
+      const r = runNode('comment-api.mjs', argv, 260_000)
+      const j = pickJson(r.stdout)
+      if (!j) { rateFailFromText(rlKind, r.stdout, r.stderr); return { ok: false, error: '贴纸发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) } }
+      if (j.need_root) return { ok: false, need_root: true, ...j, hint: '楼中楼判不出楼根，先拿 root_comment_id 再传（没发出）' }
+      if (j.http === 403 || /403|Forbidden|频繁|验证码|登录失效/i.test(String(j.error || j.head || ''))) {
+        rateFailFromText(rlKind, '403 限流 ' + String(j.error || j.head || ''))
+        return { ok: false, blocked: true, reason: 'cooldown', rate_limited: true, ...j, hint: '抖音限流了，风控已冷却，别重试。' }
+      }
+      if (j.ok) {
+        markAction(HOME, rlKind, rateOpts())
+        markStickerSent(HOME, sticker.key)
+        if (replyTo) countReply(HOME, replyToUid); else countProactiveComment(HOME)
+      } else {
+        rateFailFromText(rlKind, j, j.error || j.head || '')
+      }
+      return { ...j, sent: Boolean(j.ok), kind: rlKind, sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name }, stickerStats: stickerStats(HOME) }
     },
   },
 ]

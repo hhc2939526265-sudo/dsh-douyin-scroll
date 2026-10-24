@@ -130,9 +130,10 @@ def main():
     # ② 写：回复某条评论
     reply_id = sys.argv[3]
     txt = open(sys.argv[4], encoding="utf-8").read().strip()
+    sticker_id = sys.argv[5] if len(sys.argv) > 5 else ""   # v0.4.0 可选：贴纸评论 id
     body = {**COMMON, "aweme_id": aweme, "text": txt, "text_extra": "[]",
             "reply_id": reply_id, "reply_to_reply_id": reply_id,
-            "aweme_type": "0", "channel_id": "0", "city": "", "sticker_id": "", "is_fold": "0"}
+            "aweme_type": "0", "channel_id": "0", "city": "", "sticker_id": sticker_id, "is_fold": "0"}
     rel2 = "/aweme/v1/web/comment/publish/?" + qs({**COMMON, "app_name": "aweme"})
     s2 = sign(rel2)
     if s2.get("err"):

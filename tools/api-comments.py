@@ -51,10 +51,53 @@ def sign(rel):
     return json.loads(out[i:out.rfind("}") + 1])
 
 
+def _first_url(v):
+    """从抖音嵌套 url_list / dict 结构里容错抠出第一个 http(s) 地址。"""
+    if isinstance(v, str):
+        return v if v.startswith("http") else ""
+    if isinstance(v, list):
+        for x in v:
+            u = _first_url(x)
+            if u:
+                return u
+    if isinstance(v, dict):
+        for k in ("url_list", "url", "origin_url", "static_url", "animate_url", "download_url", "uri"):
+            if k in v:
+                u = _first_url(v[k])
+                if u:
+                    return u
+    return ""
+
+
+def extract_sticker(c):
+    """从一条评论 raw 里抠贴纸 / 图片评论（表情包收集入口）。没有返回 None。只读。"""
+    if not isinstance(c, dict):
+        return None
+    st = c.get("sticker") or {}
+    sid = str(c.get("sticker_id") or (st.get("id") if isinstance(st, dict) else "") or "").strip()
+    url = ""
+    kind = "sticker"
+    if isinstance(st, dict):
+        url = (_first_url(st.get("url_list")) or _first_url(st.get("url"))
+               or _first_url(st.get("static_url")) or _first_url(st.get("animate_url"))
+               or _first_url(st.get("origin_url")))
+    if not sid and not url:
+        imgs = c.get("image_list") or []
+        if imgs:
+            url = _first_url(imgs[0])
+            kind = "gif"
+    name = (st.get("name") if isinstance(st, dict) else "") or c.get("text") or ""
+    if sid or url:
+        return {"sticker_id": sid, "name": str(name)[:60], "url": url,
+                "kind": kind, "source": "comment", "aweme_id": str(c.get("aweme_id") or "")}
+    return None
+
+
 def main():
     aweme = sys.argv[1] if len(sys.argv) > 1 else "7698980229549139835"
     seen = set()
     total = 0
+    stickers = {}   # key -> 贴纸记录（去重）；供大肥鱼表情包库收集
     for page in range(4):
         rel = "/aweme/v1/web/comment/list/?" + qs({**COMMON, "aweme_id": aweme, "count": 20, "cursor": page * 20, "item_type": 0})
         s = sign(rel)
@@ -80,9 +123,17 @@ def main():
             for rr in (c.get("reply_comment") or [])[:6]:
                 print("      └ reply cid=%s %s [%s]  %s" % (rr.get("cid"), (rr.get("user") or {}).get("nickname"),
                                                             (rr.get("text") or "").replace("\n", " ")[:90], rr.get("create_time")))
+                st = extract_sticker(rr)
+                if st and (st["sticker_id"] or st["url"]):
+                    stickers.setdefault(st["sticker_id"] or st["url"], st)
+            st = extract_sticker(c)
+            if st:
+                stickers.setdefault(st["sticker_id"] or st["url"], st)
         if not fresh or not j.get("has_more"):
             break
     print("合计 %d 条" % total)
+    # ⭐ 表情包收集：机器可读一行，host/MCP 抓到后喂给 lib/stickers.mjs（安全审核通过才允许用）
+    print("STICKERS_JSON=" + json.dumps(list(stickers.values()), ensure_ascii=False))
     return 0
 
 

@@ -104,7 +104,17 @@ const readMessages = async (ev) => {
       }
       var pc = found.parsedContent || {};
       var text = String(pc.text || pc.content_title || '').replace(/\\s+/g, ' ').trim();
-      out.push({ own: side, text: text, awe: pc.aweType || 0, item: pc.itemId ? String(pc.itemId) : '' });
+      // ⭐ v0.4.0 表情包收集：消息里的表情图（中号方形、非头像 28–48、非分享卡缩略图~108）。
+      //    web 端表情有时是 canvas/背景拿不到，拿不到就留空，绝不硬凑。
+      var stk = Array.prototype.slice.call(n.querySelectorAll('img')).filter(function(img){
+        var b = img.getBoundingClientRect();
+        if (b.width < 56 || b.width > 200) return false;
+        if (Math.abs(b.width - b.height) > 8) return false;
+        if (b.width >= 100 && b.width <= 116) return false;
+        var src = img.currentSrc || img.src || '';
+        return /douyinpic|sticker|emoji|webcast|aweme/i.test(src);
+      }).map(function(img){ return img.currentSrc || img.src || ''; })[0] || '';
+      out.push({ own: side, text: text, awe: pc.aweType || 0, item: pc.itemId ? String(pc.itemId) : '', sticker: stk });
     });
     return JSON.stringify(out);
   })()`)

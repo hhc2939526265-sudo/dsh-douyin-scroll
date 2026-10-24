@@ -29,7 +29,7 @@ console.log('1. 文件清单')
 const required = [
   'package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'requirements.txt',
   'lib/hostdeps.mjs', 'lib/state.mjs', 'lib/credential.mjs', 'lib/notify.mjs', 'lib/toast.mjs', 'lib/uvfetch.mjs',
-  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs', 'lib/ratelimit.mjs',
+  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs', 'lib/ratelimit.mjs', 'lib/stickers.mjs',
   'prompts/duty.md', 'prompts/persona.default.md', 'prompts/sample-candidates.json',
   // 给别的 AI / MCP 用的那一层
   'AI-USAGE.md', 'tools/mcp-server.mjs', 'tools/doctor.mjs', 'check-client.mjs',
@@ -1319,6 +1319,117 @@ console.log('RLRESULT ' + JSON.stringify({g1,f,g2,rs,g3,g4}));`
     } else bad(`风控行为不符：${m[1]}`)
   } else bad(`风控动态测试没跑通：${String(rr.stderr || rr.stdout || '').slice(0, 200)}`)
 } catch (e) { bad(`v0.3.9 检查失败：${e.message}`) }
+
+/* ── 4r. v0.4.0：自适应抽帧 + 语音识别 + 表情包收集/安全/发表 ── */
+console.log('\n4r. v0.4.0 看得更全·听得到·安全表情包')
+try {
+  const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  const mcp = readFileSync(join(here, 'tools', 'mcp-server.mjs'), 'utf8')
+  const fp = readFileSync(join(here, 'tools', 'forward-pick.py'), 'utf8')
+  const stkFile = join(here, 'lib', 'stickers.mjs')
+  const stk = existsSync(stkFile) ? readFileSync(stkFile, 'utf8') : ''
+  const cm = readFileSync(join(here, 'tools', 'comment-api.mjs'), 'utf8')
+  const ac = readFileSync(join(here, 'tools', 'api-comments.py'), 'utf8')
+  const doc = readFileSync(join(here, 'tools', 'doctor.mjs'), 'utf8')
+
+  // ① 自适应抽帧（按时长 3 秒一帧、上限、宽度）
+  if (/def frame_plan/.test(fp) && /frameTargetSec/.test(fp) && /frameMax/.test(fp) && /scale=/.test(fp)) {
+    ok('forward-pick.py 按时长自适应抽帧（frame_plan + 密度/上限/宽度）')
+  } else bad('forward-pick.py 缺自适应抽帧（frame_plan / frameTargetSec / frameMax / scale）')
+  for (const k of ['frameTargetSec', 'frameMax', 'frameWidth']) {
+    if (idx.includes(k + ':') && idx.includes("'" + k + "'")) ok(`host 配置项 ${k}`)
+    else bad(`host 缺配置项 ${k}`)
+  }
+  if (/'frameCount' in p\) p\.frameCount = Math\.max\(2/.test(idx)) ok('frameCount 兜底范围改为 2–12（配合自适应）')
+  else bad('frameCount clamp 未随自适应更新（应 2–12）')
+
+  // ② 语音识别：官方字幕优先 + 本地 Whisper 可选
+  if (/def find_subtitle_urls/.test(fp) && /def parse_subtitle_bytes/.test(fp) && /def transcribe_whisper/.test(fp) && /def grab_spoken/.test(fp)) {
+    ok('forward-pick.py 有官方字幕解析 + 本地 Whisper 转写（字幕优先）')
+  } else bad('forward-pick.py 缺语音识别（字幕/Whisper 函数）')
+  if (/grab_frames\([\s\S]*?\)\s*\{[\s\S]*?spoken/.test(fp) || /spoken_kind/.test(fp)) ok('抓帧结果带 spoken/spoken_kind')
+  else bad('抓帧结果未带 spoken/spoken_kind')
+  for (const k of ['useOfficialSubtitle', 'useAsr', 'asrModel', 'spokenMaxChars']) {
+    if (idx.includes(k + ':')) ok(`host 配置项 ${k}`)
+    else bad(`host 缺语音配置项 ${k}`)
+  }
+  if (/spoken_kind: x\.spoken_kind/.test(idx)) ok('host douyin_forward/证据包透传 spoken')
+  else bad('host 未透传 spoken')
+  if (/spoken_kind: x\.spoken_kind/.test(mcp)) ok('MCP douyin_forward 透传 spoken')
+  else bad('MCP 未透传 spoken')
+  if (/Whisper/i.test(doc) && /faster_whisper/i.test(doc)) ok('doctor 检测本地 Whisper（可选项）')
+  else bad('doctor 没检测 Whisper')
+
+  // ③ 表情包库（lib/stickers.mjs）
+  if (stk && /export function reviewSticker/.test(stk) && /export function pickSticker/.test(stk)
+      && /export function ingestStickers/.test(stk) && /export function nameBlocked/.test(stk)) {
+    ok('lib/stickers.mjs 提供收集/审核/挑选/黑名单')
+  } else bad('lib/stickers.mjs 缺关键导出（ingest/review/pick/nameBlocked）')
+  if (/import[\s\S]*from '\.\/lib\/stickers\.mjs'/.test(idx)) ok('host index.js 引用 lib/stickers.mjs')
+  else bad('host 未引用 stickers 库')
+  if (/from '\.\.\/lib\/stickers\.mjs'/.test(mcp)) ok('MCP server 引用 lib/stickers.mjs')
+  else bad('MCP 未引用 stickers 库')
+
+  // ④ 收集通路：评论 raw 抠贴纸并输出 STICKERS_JSON
+  if (/def extract_sticker/.test(ac) && /STICKERS_JSON=/.test(ac)) ok('api-comments.py 解析评论贴纸并输出 STICKERS_JSON')
+  else bad('api-comments.py 缺贴纸收集（extract_sticker / STICKERS_JSON）')
+  if (/STICKERS_JSON=/.test(idx) && /ingestStickers\(stateDir/.test(idx)) ok('host 拉评论时收集贴纸入库')
+  else bad('host 拉评论未收集贴纸')
+  if (/STICKERS_JSON=/.test(mcp) && /ingestStickers\(HOME/.test(mcp)) ok('MCP 拉评论时收集贴纸入库')
+  else bad('MCP 拉评论未收集贴纸')
+  if (/sticker: stk/.test(readFileSync(join(here, 'tools', 'im-send.mjs'), 'utf8'))) ok('私信只读时尽力收集聊天表情图')
+  else bad('私信读取未收集表情图')
+
+  // ⑤ 安全红线：只发 approved，黑名单一票否决
+  if (/sticker\.status !== 'approved'/.test(idx) && /sticker\.status !== 'approved'/.test(mcp)) {
+    ok('发表情前硬校验只发 approved（host + MCP）')
+  } else bad('缺少「只发 approved」硬校验')
+  if (/名称黑名单（视觉放行也不允许）/.test(stk)) ok('名称黑名单对视觉放行有一票否决')
+  else bad('贴纸黑名单未拥有最高否决权')
+
+  // ⑥ 发表通路：评论 publish 原生 sticker_id
+  if (/--sticker/.test(cm) && /sticker_id: STICKER/.test(cm)) ok('comment-api.mjs 支持 --sticker 走 publish sticker_id')
+  else bad('comment-api.mjs 贴纸评论通路缺失')
+  for (const t of ['douyin_sticker_list', 'douyin_sticker_review', 'douyin_comment_sticker']) {
+    if (idx.includes(`name: '${t}'`)) ok(`host 有 ${t}`)
+    else bad(`host 缺 ${t}`)
+    if (mcp.includes(`name: '${t}'`)) ok(`MCP 有 ${t}`)
+    else bad(`MCP 缺 ${t}`)
+  }
+  // 贴纸发送也要 confirm 闸
+  if (/name: 'douyin_comment_sticker'[\s\S]{0,4000}?confirm: \{ type: 'boolean'/.test(mcp)
+      && /name: 'douyin_comment_sticker'[\s\S]{0,5000}?args\?\.confirm !== true/.test(mcp)) {
+    ok('douyin_comment_sticker 带 confirm 闸')
+  } else bad('douyin_comment_sticker 缺 confirm 闸')
+  for (const k of ['collectSticker', 'useSticker', 'stickerPerDay', 'stickerSafeOnly']) {
+    if (idx.includes(k + ':')) ok(`host 配置项 ${k}`)
+    else bad(`host 缺贴纸配置项 ${k}`)
+  }
+
+  // ⑦ 动态跑一遍贴纸库：黑名单直接拦、视觉审核、只发 approved、每日计数
+  const sscript = `import { pathToFileURL } from 'node:url'; import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
+const m = await import(pathToFileURL(${JSON.stringify(stkFile)}).href);
+const h = mkdtempSync(join(tmpdir(),'stk-'));
+const a = m.addSticker(h,{sticker_id:'b1',name:'血腥暴力',source:'comment'});
+const b = m.addSticker(h,{sticker_id:'c1',name:'可爱猫',source:'comment'});
+const rb = m.reviewSticker(h,b.key,'approved','可爱');
+const override = m.reviewSticker(h,a.key,'approved','可爱');
+const pick = m.pickSticker(h);
+m.markStickerSent(h,b.key);
+const stats = m.stickerStats(h);
+const blockedName = m.nameBlocked('某色情视频');
+const okName = m.nameBlocked('大肥鱼');
+console.log('STKRESULT ' + JSON.stringify({a:a.status, b:b.status, rb:rb.status, override:override.status, pick:pick&&pick.sticker_id, sent:m.stickerSentToday(h), app:stats.approved, blk:stats.blocked, blockedName, okName}));`
+  const sr = spawnSync(process.execPath, ['--input-type=module', '-e', sscript], { encoding: 'utf8' })
+  const sm = String(sr.stdout || '').match(/STKRESULT (\{.*\})/)
+  if (sr.status === 0 && sm) {
+    const r = JSON.parse(sm[1])
+    if (r.a === 'blocked' && r.b === 'pending' && r.rb === 'approved' && r.override === 'blocked'
+        && r.pick === 'c1' && r.sent === 1 && r.app === 1 && r.blk === 1 && r.blockedName === true && r.okName === false) {
+      ok('贴纸库行为正确：黑名单直拦→视觉审核→只发approved→每日计数')
+    } else bad(`贴纸库行为不符：${sm[1]}`)
+  } else bad(`贴纸库动态测试没跑通：${String(sr.stderr || sr.stdout || '').slice(0, 200)}`)
+} catch (e) { bad(`v0.4.0 检查失败：${e.message}`) }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) {

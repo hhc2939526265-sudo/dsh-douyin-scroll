@@ -29,6 +29,7 @@ forward-msg.txt
 engage.json
 tastes-inbox.jsonl
 ratelimit.json
+stickers.json
 *.log
 
 chrome-profile/

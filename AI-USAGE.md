@@ -58,7 +58,7 @@ node "<插件目录>/tools/mcp-server.mjs"
 
 ---
 
-## 2. 工具清单（13 个）
+## 2. 工具清单（16 个）
 
 ### 只读（随便调，什么都不改）
 
@@ -66,13 +66,20 @@ node "<插件目录>/tools/mcp-server.mjs"
 |---|---|---|
 | `douyin_guide` | 返回本文档全文 | **第一次接进来先调这个** |
 | `douyin_status` | 今天跑了没跑、挑了几条、额度、报告路径 | 想知道"现在什么情况" |
-| `douyin_doctor` | 环境体检（9 项） | 装完 / 换设备 / 报错时 |
+| `douyin_doctor` | 环境体检（含可选 ffmpeg / Whisper 检测） | 装完 / 换设备 / 报错时 |
 | `douyin_whoami` | 登录还在不在、当前是哪个号 | 任何操作前不确定登录态 |
-| `douyin_forward` | 拉推荐流候选 + 打分 + 官方分享链接 | **主入口**：要推荐视频就调它 |
-| `douyin_comments` | 读一个视频的评论（含楼中楼） | 判断「这视频好不好玩」 |
+| `douyin_forward` | 拉推荐流候选 + 打分 + 官方分享链接（每条带**自适应画面帧 `frames` + 台词 `spoken`**） | **主入口**：要推荐视频就调它 |
+| `douyin_comments` | 读一个视频的评论（含楼中楼）；**顺手收集评论里的表情**进待审库 | 判断「这视频好不好玩」 |
 | `douyin_notices` | 谁 @ 了你 / **谁回复了你的评论** / 谁评论点赞关注（每条带 `comment_id` + `root_comment_id`） | 回消息前先看 |
 | `douyin_at_me` | ⭐ **谁在跟我说话** —— @ 我 + **回复了我的评论**（带"回过没有"+ 我在这条视频下说过什么 + 楼根） | 回评论前调它 |
-| `douyin_im_read` | 读私信会话（带 from: me/them） | 看对方最近说了什么 |
+| `douyin_im_read` | 读私信会话（带 from: me/them）；**尽力收集聊天表情**（只可能来自老大） | 看对方最近说了什么 |
+| `douyin_sticker_list` | 列表情库 pending / approved / blocked（每条带 `thumb`） | 审核表情、找能发的表情 |
+
+### 改本地库（不对外发抖音，不用 confirm，但要先看清图）
+
+| 工具 | 干什么 |
+|---|---|
+| `douyin_sticker_review` | 🔴 **表情安全审核**：先 Read 贴纸 `thumb` 亲眼看，再 `decision:"approved"/"blocked"` + 标签。只放行可爱/萌/抽象/搞笑/大肥鱼/治愈/萌宠；色情/暴力/血腥/恐怖/恶心/违法/涉政/辱骂/未成年向一律 block |
 
 ### 会发东西（**必须 `confirm: true`**）
 
@@ -82,6 +89,7 @@ node "<插件目录>/tools/mcp-server.mjs"
 | `douyin_dm` | 发一条私信 |
 | `douyin_comment_reply` | 发评论 / 回复某条评论。**`mode:"api"`（默认）直接回复楼层；`mode:"ui"` 真 @ 顶层**。回楼中楼要额外传 `root_comment_id`（楼根，通知才发给对方而不是楼主）。⭐ **不传 comment_id = 主动顶层评论**（受每日上限）；**回复别人**再传 `reply_to_uid`（同人每天≤2 次）+ `reply_to_text`（对方原文，恶意/抬杠/引流会被拦） |
 | `douyin_comment_mention` | 同上，等价于 `mode:"ui"` 的便捷入口（真 @、UI 点选）—— 2026-10-23 新增 |
+| `douyin_comment_sticker` | **发表情包**（2026-10-25 新增）：传 `sticker_key`，只发审核通过的平台贴纸；给 `comment_id` 是回某条、不给是顶层表情评论。受风控节奏 + 每日贴纸上限，需 `confirm:true`；自定义图片/GIF 会返回 `unsupported` |
 
 ### ⭐⭐ 该用哪个：**有评论可回就回复，没评论可回才 @**（2026-10-23 定稿）
 
@@ -224,19 +232,25 @@ node "<插件目录>/tools/mcp-server.mjs"
 ❌ 不要先调 `douyin_dm` 发文字、再调 `douyin_share_card` 补卡片 —— 顺序会反，
 对方先看到一句话、却不知道在说哪条视频。
 
-### ③ 👀 能看画面（frames）；但听不到声音、不做 ASR
+### ③ 👀 能看画面（自适应 frames）；🎙️ 台词看官方字幕、可选本地 Whisper
 
 这个插件**看得到每条视频的画面**：`douyin_forward` 与证据包每条候选都带 `frames` 字段——
-一张高清封面 `cover.jpg` 加若干关键帧 `frame_1…n.jpg`（默认 3 帧，从视频开头/中间/结尾抽，
-`frames_kind=video` 表示抽到了视频帧，`cover` 表示只有封面，`none/off` 表示没抓到）。
+一张高清封面 `cover.jpg` 加**按视频时长自适应**的关键帧 `frame_1…n.jpg`（约每 3 秒一帧、每条最多 12 帧、
+宽 640，从开头到结尾覆盖更全又不费 token；`frames_kind=video` 表示抽到了视频帧，`cover` 表示只有封面，
+`none/off` 表示没抓到）。
 
 判断一条之前，**先逐张 Read 这些 `frames` 相对路径**（模型工作目录就是插件家，直接能读到），
-再结合文案 / 标签 / 作者 / 时长 / 点赞·评论·收藏·转发 / 高赞评论文本印证。喜欢、分享的理由
+再结合文案 / 标签 / 作者 / 时长 / 点赞·评论·收藏·转发 / 高赞评论印证。喜欢、分享的理由
 最好能说出"哪一帧、哪个画面"。
 
-但它**听不到声音、没有字幕、不做 ASR/OCR**。所以：
+**台词**：每条还带 `spoken`（台词文本）和 `spoken_kind`：
+- `official_subtitle` = 抖音官方字幕，直接用；
+- `asr` = 没有字幕、用本地 Whisper 转写（可能有少量错字，需装可选依赖 `faster-whisper` 并开启）；
+- `none` / `off` = 没有字幕、也没开 Whisper。
 
-- 别假装听懂了台词、配乐、说了什么 —— 画面+文案+评论能判就判
+所以：
+
+- `spoken_kind=none/off` 时，**别假装听懂了台词/配乐/说了什么**——没有字幕就是没有，靠画面+文案+评论判
 - 只有封面（`frames_kind=cover`）时，老实说"只看了封面"，别编视频里的画面
 - 抓不到画面（`frames_kind=none`，通常是没装 ffmpeg 且封面也没拿到）时，退回只看文本信号
 - 画面和数据都不够就写「判断不了」，**别硬猜**
@@ -321,5 +335,6 @@ node "<插件目录>/tools/mcp-server.mjs"
 - **不做**「跑一轮 → 写日报」：那是 DSH 插件的值班链路（要 headless 会话），MCP 版不复制
 - **不做**回读核实：卡片/私信发完，MCP 版只报"发出去了"，真落地没落地请使用者自己看一眼
 - **能做**真 @：`douyin_comment_mention`（UI 点选，2026-10-23 加）；但它要起 Chrome、20-40 秒、昵称必须搜得到
-- **能看**画面（封面 + 关键帧 `frames`，见规矩 ③）；**听不到**声音、不做 ASR/OCR
+- **能看**画面（封面 + 自适应关键帧 `frames`，见规矩 ③）；**能拿台词**：优先抖音官方字幕，没有字幕时若装了 `faster-whisper` 并开启可本地转写；都没有就老实标「无台词」，不假装听懂
+- **能发的表情**仅限评论区平台贴纸（`douyin_comment_sticker`）且必须审核通过；自定义图片/GIF 评论、私信图片在 web 端不保证成功
 - **不联网上传**任何东西；Cookie 只在本机

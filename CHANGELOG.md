@@ -5,6 +5,31 @@
 
 ---
 
+## 0.4.0 — 2026-10-25
+
+### 看得更全、听得台词、自己收集并安全发表情包
+
+- **🎞️ 抽帧自适应：内容更完整又不费 token**（新 `frameTargetSec` 默认 3 秒/帧、`frameMax` 默认 12、
+  `frameWidth` 默认 640，可选 320/480/640/720）：不再固定 3 帧，而是按视频时长约每 3 秒抽一帧、
+  每条封顶 12 帧、宽度降到 640，从开头到结尾覆盖更全（原来的 `frameCount` 改为"时长未知时兜底帧"，2–12）。
+- **🎙️ 语音识别：官方字幕优先 + 本地 Whisper 可选**：每条候选新增 `spoken` / `spoken_kind`：
+  优先取抖音**官方字幕**（`official_subtitle`，最省最稳）；没有字幕且装了可选依赖 `faster-whisper`
+  并打开 `useAsr` 时才本地转写（`asr`，CPU 走 int8、VAD 过滤、默认 small 档）；都没有就老实标
+  `none/off`，大肥鱼**不编造台词**。`spokenMaxChars` 默认 600 控长度。doctor 新增 Whisper 可选项检测。
+- **🐟 表情包：自己收集 · 视觉审核 · 安全了才发**（新 `lib/stickers.mjs`，状态落 `stickers.json`）：
+  - 收集：`douyin_comments` 自动解析评论里的平台贴纸/图片评论（`api-comments.py` 输出 `STICKERS_JSON`），
+    `douyin_im_read` 尽力收集聊天里的表情图（只来自老大的会话），新表情一律 `pending`。
+  - 审核：新工具 `douyin_sticker_list` / `douyin_sticker_review`——大肥鱼逐张 Read 表情图亲自拍板，
+    只放行可爱/萌/抽象/搞笑/大肥鱼/治愈/萌宠，色情/暴力/血腥/恐怖/恶心/违法/涉政/辱骂/未成年向一律 block；
+    名称黑名单 + 视觉审核**双保险**，黑名单对视觉放行有一票否决。
+  - 发送：新工具 `douyin_comment_sticker` 走评论 publish 原生 `sticker_id`（最稳），只发 `approved`，
+    受同一套拟人风控 + 主动评论/回复上限 + 每日贴纸上限 `stickerPerDay`（默认 5）约束，需 confirm。
+    自定义图片/GIF（无贴纸 id）web 评论发不了、会明确返回 `unsupported`，不硬试。
+  - 面板新增「看画面/听台词」与「表情包」设置卡；`useSticker` 默认关（先收集审核够了再开）。
+- 工具数：host 22 → **25**、MCP 13 → **16**（新增 sticker_list / sticker_review / comment_sticker）。
+
+---
+
 ## 0.3.9 — 2026-10-24
 
 ### 大肥鱼真的能看画面、私信只认老大、并内置一套降封号风控

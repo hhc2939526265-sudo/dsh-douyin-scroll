@@ -5,19 +5,23 @@ tools/forward-pick.py —— 刷一轮：拉候选 → 打分 → 抓画面关�
 ============================================================================
 只读、**不签名**、不碰写接口。判断依据：
   · 文本信号：desc / tags / author / create_time / duration / digg·comment·collect·share / 高赞评论；
-  · ⭐ 画面信号（2026-10-24 起）：对入选候选抓**高清封面 + 关键帧**（有 ffmpeg 时从视频抽
-    开头/中间/结尾若干帧，没有 ffmpeg 也一定有封面），写到 `frames/<视频ID>/`，
-    让值班那一轮的模型能**真的看到画面**再决定喜不喜欢、要不要分享。
-  抓帧失败一律降级为只看文本，不影响主流程。
+  · ⭐ 画面信号（2026-10-24 起）：对入选候选抓**高清封面 + 自适应关键帧**（按时长约 3 秒一帧、
+    上限 12 帧，既覆盖开头到结尾、又不堆太多图费 token），写到 `frames/<视频ID>/`，让值班模型
+    **真的看到画面**再决定喜不喜欢；
+  · ⭐ 台词信号（2026-10-25 起）：优先取抖音**官方字幕**，没有且装了可选依赖 faster-whisper 时
+    本地转写（`spoken/spoken_kind`），都没有就老实标注「无台词文本」。
+  抓帧/字幕/转写失败一律降级，不影响主流程。
 
 用法:
-  python tools/forward-pick.py            # 拉 feed 3 页 + 热榜，出清单 + 抓帧
+  python tools/forward-pick.py            # 拉 feed 3 页 + 热榜，出清单 + 抓帧 + 抓台词
   python tools/forward-pick.py --no-frames  # 只出清单，不下载画面
+  python tools/forward-pick.py --no-spoken  # 不抓台词（字幕/Whisper）
   python tools/forward-pick.py --dump     # 额外打印原始结构，排错用
 """
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -208,17 +212,250 @@ def _dl_bin(s, url, path, timeout=40):
         return False
 
 
-def grab_frames(s, r, a, want_frames, frame_count):
+def frame_plan(dur_s, cfg):
     """
-    给一条候选抓画面。返回相对 HOME 的帧路径列表（posix 斜杠）。
-    一定尽力给「高清封面」；有 ffmpeg 再从视频抽 frame_count 帧。
-    任何失败都静默降级（这条的画面可缺，不能连累整轮）。
+    自适应抽帧数量（要「内容基本完整、又不太费 token」）：
+      · 按 frameTargetSec 秒/帧 的密度，随视频时长增减（长视频自然多抽，不漏关键画面）；
+      · 上下限 frameMax（默认 12）封顶控成本；时长未知时退回 frameCount（默认 3）。
+    """
+    target = float(cfg.get("frameTargetSec") or 3.0) or 3.0
+    fmax = int(cfg.get("frameMax") or 12)
+    fb = int(cfg.get("frameCount") or 3)
+    fmax = max(2, min(fmax, 20))
+    if dur_s and dur_s > 0:
+        n = int(round(dur_s / target))
+        return max(2, min(n, fmax))
+    return max(2, min(fb, fmax))
+
+
+def find_subtitle_urls(a):
+    """
+    递归从 aweme 里找抖音**官方字幕**地址（srt/vtt/json）。
+    抖音字段名/层级会变，常见在 video.subtitleInfos[*].Url，做容错：
+      key 名含 subtitle/caption，且里面能找到 http 地址、看起来像字幕文件就收。
+    """
+    urls = []
+
+    def looks_like_sub(u):
+        if not (isinstance(u, str) and u.startswith("http")):
+            return False
+        low = u.lower()
+        return (".srt" in low or ".vtt" in low or "subtitle" in low or "caption" in low)
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kl = str(k).lower()
+                if ("subtitle" in kl or "caption" in kl) and isinstance(v, (list, dict, str)):
+                    collect(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    def collect(o):
+        if isinstance(o, str):
+            if looks_like_sub(o):
+                urls.append(o)
+            else:
+                # 有时 Url 是一段 URL 编码 / base64 的 JSON
+                for cand in _decode_url_field(o):
+                    if looks_like_sub(cand):
+                        urls.append(cand)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if str(k).lower() in ("url", "url_list", "subtitleurl", "subtitle_url"):
+                    if isinstance(v, str):
+                        collect(v)
+                    elif isinstance(v, list):
+                        for u in v:
+                            collect(u)
+                elif isinstance(v, (dict, list)):
+                    collect(v)
+        elif isinstance(o, list):
+            for v in o:
+                collect(v)
+
+    walk(a)
+    # 去重保序
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:4]
+
+
+def _decode_url_field(s):
+    """字幕 Url 字段有时是 base64(JSON) 或 URL 编码，尽量解出里面的 http 地址。"""
+    import base64
+    import urllib.parse
+    cands = []
+    for txt in (s, urllib.parse.unquote(s)):
+        if txt.startswith("http"):
+            cands.append(txt)
+        # 直接找 http 子串
+        i = txt.find("http")
+        if i >= 0:
+            cands.append(txt[i:].strip('"').strip("\\")[:400])
+    try:
+        raw = base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "ignore")
+        i = raw.find("http")
+        if i >= 0:
+            cands.append(raw[i:].strip('"').strip("\\")[:400])
+    except Exception:
+        pass
+    return cands
+
+
+def parse_subtitle_bytes(blob):
+    """把下载到的字幕（srt / vtt / json）转成干净的纯文本台词。"""
+    if not blob:
+        return ""
+    txt = None
+    if isinstance(blob, bytes):
+        for enc in ("utf-8", "utf-8-sig", "gbk"):
+            try:
+                txt = blob.decode(enc)
+                break
+            except Exception:
+                continue
+        if txt is None:
+            txt = blob.decode("utf-8", "ignore")
+    else:
+        txt = str(blob)
+    txt = txt.strip()
+    if not txt:
+        return ""
+    # JSON 字幕（抖音有时直接给 {utterances:[{text}]}/{text}）
+    if txt[0] in "{[":
+        try:
+            j = json.loads(txt)
+            parts = []
+
+            def pull(o):
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        if str(k).lower() in ("text", "utf8", "content", "word") and isinstance(v, str):
+                            parts.append(v)
+                        elif isinstance(v, (dict, list)):
+                            pull(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        pull(v)
+            pull(j)
+            if parts:
+                return _clean_subtitle(" ".join(parts))
+        except Exception:
+            pass
+    # srt / vtt：去掉序号行、时间轴行、标签
+    lines = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.isdigit():
+            continue
+        if line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        if "-->" in line:
+            continue
+        line = re.sub(r"<[^>]+>", "", line)   # 去 <c> </c> <00:00> 之类标签
+        if line:
+            lines.append(line)
+    return _clean_subtitle(" ".join(lines))
+
+
+def _clean_subtitle(t):
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def transcribe_whisper(ff, video_path, cfg):
+    """
+    没有官方字幕时，用本地 Whisper（可选依赖 faster-whisper）转写。
+    缺依赖 / 模型下不下来 / 转写失败一律静默返回空串，外层降级。
+    """
+    if not cfg.get("useAsr"):
+        return "", "none"
+    try:
+        from faster_whisper import WhisperModel  # noqa: 可选依赖
+    except Exception:
+        return "", "none"
+    tmp_wav = None
+    try:
+        fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="dya_")
+        os.close(fd)
+        p = subprocess.run(
+            [ff, "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", tmp_wav],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        if p.returncode != 0:
+            return "", "none"
+        model_name = str(cfg.get("asrModel") or "small")
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(tmp_wav, language=zh_lang(cfg), vad_filter=True, beam_size=1)
+        text = " ".join(seg.text.strip() for seg in segments if seg.text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text, "asr"
+    except Exception:
+        return "", "none"
+    finally:
+        if tmp_wav:
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
+
+
+def zh_lang(cfg):
+    return str(cfg.get("asrLang") or "zh")
+
+
+def grab_spoken(s, a, video_path, ff, cfg):
+    """
+    取一条视频的「台词」：①抖音官方字幕优先（省、稳）→ ②本地 Whisper 可选 → ③none。
+    返回 (spoken_text, kind)。文本截断到 spokenMaxChars 控 token。
+    """
+    max_chars = int(cfg.get("spokenMaxChars") or 600)
+    # ① 官方字幕
+    if cfg.get("useOfficialSubtitle", True):
+        for u in find_subtitle_urls(a):
+            try:
+                r = s.get(u, timeout=25, headers={"Referer": BASE + "/", "Accept": "*/*"})
+                if r.status_code == 200 and r.content:
+                    spoken = parse_subtitle_bytes(r.content)
+                    if spoken:
+                        return spoken[:max_chars], "official_subtitle"
+                time.sleep(0.3)
+            except Exception:
+                continue
+    # ② 本地 Whisper（可选）
+    if video_path and ff:
+        spoken, kind = transcribe_whisper(ff, video_path, cfg)
+        if spoken:
+            return spoken[:max_chars], kind
+    return "", "none"
+
+
+def grab_frames(s, r, a, want_frames, cfg):
+    """
+    给一条候选抓画面 + 台词。
+    返回 (frames, spoken, spoken_kind)：
+      frames 是相对 HOME 的帧路径（posix 斜杠），一定尽力给高清封面；有 ffmpeg 再按自适应密度抽关键帧。
+      spoken 是台词文本（官方字幕或本地 Whisper），spoken_kind 标来源。
+    任何失败都静默降级（这条的画面/台词可缺，不能连累整轮）。
     """
     aid = r["aweme_id"]
     ddir = os.path.join(HOME, "frames", str(aid))
     os.makedirs(ddir, exist_ok=True)
     rel = []
     video_url, cover_url = pick_media(a)
+    width = int(cfg.get("frameWidth") or 640)
+    if width not in (320, 480, 640, 720):
+        width = 640
+    spoken, spoken_kind = "", "none"
+    ff = find_ffmpeg() if (want_frames and video_url) else ""
 
     # ① 高清封面（零依赖，先保证有一张能看）
     if cover_url:
@@ -227,50 +464,45 @@ def grab_frames(s, r, a, want_frames, frame_count):
             rel.append("frames/%s/cover.jpg" % aid)
         time.sleep(random.uniform(0.4, 1.2))
 
-    # ② 关键帧：需要 ffmpeg + 可播放地址
-    if want_frames and video_url:
-        ff = find_ffmpeg()
-        if ff:
-            tmp_video = None
-            try:
-                fd, tmp_video = tempfile.mkstemp(suffix=".mp4", prefix="dyv_")
-                os.close(fd)
-                if _dl_bin(s, video_url, tmp_video, timeout=60):
-                    # 时长（秒）；抽帧位置按比例 10%/45%/80%…，保证开头/中间/结尾都覆盖
-                    n = max(1, min(int(frame_count or 3), 6))
-                    ratios = [ (i + 1) / (n + 1) for i in range(n) ]
-                    dur = float(r.get("duration_s") or 0)
-                    made = 0
-                    for i, ratio in enumerate(ratios, 1):
-                        pos = max(0.5, dur * ratio) if dur else float(3 * i)
-                        out = os.path.join(ddir, "frame_%d.jpg" % i)
-                        cmd = [ff, "-y", "-ss", ("%.2f" % pos), "-i", tmp_video,
-                               "-frames:v", "1", "-q:v", "3", "-vf", "scale=720:-2", out]
-                        try:
-                            p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-                            if p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
-                                rel.append("frames/%s/frame_%d.jpg" % (aid, i))
-                                made += 1
-                        except Exception:
-                            continue
-                    if made:
-                        # 清理临时视频（帧已落盘）
-                        try:
-                            os.remove(tmp_video)
-                        except Exception:
-                            pass
-                        return rel
-            except Exception:
-                pass
-            finally:
-                if tmp_video:
+    # ② 关键帧（自适应密度）+ 台词：需要 ffmpeg + 可播放地址；同一份视频只下载一次
+    tmp_video = None
+    if want_frames and video_url and ff:
+        try:
+            fd, tmp_video = tempfile.mkstemp(suffix=".mp4", prefix="dyv_")
+            os.close(fd)
+            if _dl_bin(s, video_url, tmp_video, timeout=60):
+                dur = float(r.get("duration_s") or 0)
+                n = frame_plan(dur, cfg)
+                ratios = [(i + 1) / (n + 1) for i in range(n)]
+                made = 0
+                for i, ratio in enumerate(ratios, 1):
+                    pos = max(0.5, dur * ratio) if dur else float(3 * i)
+                    out = os.path.join(ddir, "frame_%d.jpg" % i)
+                    cmd = [ff, "-y", "-ss", ("%.2f" % pos), "-i", tmp_video,
+                           "-frames:v", "1", "-q:v", "3", "-vf", "scale=%d:-2" % width, out]
                     try:
-                        os.remove(tmp_video)
+                        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+                        if p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
+                            rel.append("frames/%s/frame_%d.jpg" % (aid, i))
+                            made += 1
                     except Exception:
-                        pass
+                        continue
+                # 台词：用刚下载好的同一份视频（官方字幕不需要视频，Whisper 才需要）
+                spoken, spoken_kind = grab_spoken(s, a, tmp_video, ff, cfg)
+        except Exception:
+            pass
+        finally:
+            if tmp_video:
+                try:
+                    os.remove(tmp_video)
+                except Exception:
+                    pass
+    elif want_frames and video_url:
+        # 有视频但没 ffmpeg：仍尝试官方字幕（纯文本下载，不需要 ffmpeg）
+        spoken, spoken_kind = grab_spoken(s, a, "", "", cfg)
     r["_video_url_ok"] = bool(video_url)
-    r["_ffmpeg"] = bool(find_ffmpeg()) if (want_frames and video_url) else False
-    return rel
+    r["_ffmpeg"] = bool(ff)
+    return rel, spoken, spoken_kind
 
 
 
@@ -280,17 +512,31 @@ def main():
     ap.add_argument("--limit", type=int, default=10, help="最多取前几条（默认 10）")
     ap.add_argument("--frames", dest="frames", action="store_true", help="抓高清封面+关键帧（默认开）")
     ap.add_argument("--no-frames", dest="frames", action="store_false", help="只出清单，不下载画面")
-    ap.add_argument("--frame-count", type=int, default=0, help="每条抽几个视频关键帧（默认取设置，3；封面始终抓）")
+    ap.add_argument("--frame-count", type=int, default=0, help="时长未知时的兜底关键帧数（默认取设置，3）")
+    ap.add_argument("--no-spoken", action="store_true", help="不抓台词（官方字幕/Whisper）")
     ap.set_defaults(frames=True)
     args = ap.parse_args()
 
     limits = load_collector()
-    # 画面开关 / 关键帧数量：命令行优先，否则读设置页 config.json
+    # 画面开关 / 抽帧密度 / 台词：命令行优先，否则读设置页 config.json
     cfg = load_config()
     want_frames = bool(args.frames and cfg.get("watchFrames", True))
     frame_count = int(args.frame_count or cfg.get("frameCount") or 3)
+    cfg["frameCount"] = frame_count
+    if args.no_spoken:
+        cfg["useOfficialSubtitle"] = False
+        cfg["useAsr"] = False
+    spoken_summary = {"official_subtitle": 0, "asr": 0, "none": 0}
     if want_frames:
-        meta_note = {"frames": "on", "frame_count": frame_count, "ffmpeg": bool(find_ffmpeg())}
+        meta_note = {
+            "frames": "on",
+            "frame_target_sec": cfg.get("frameTargetSec", 3.0),
+            "frame_max": cfg.get("frameMax", 12),
+            "frame_width": cfg.get("frameWidth", 640),
+            "ffmpeg": bool(find_ffmpeg()),
+            "official_subtitle": cfg.get("useOfficialSubtitle", True),
+            "asr": bool(cfg.get("useAsr")),
+        }
     else:
         meta_note = {"frames": "off"}
     # ⭐ 硬筛计数：报告里要能说清"因为什么跳过了几条"，不能只给个最终条数
@@ -374,8 +620,9 @@ def main():
     rows.sort(key=lambda r: -r["score"])
     top = rows[:max(1, args.limit)]
 
-    # ⭐ 给入选候选抓画面（高清封面 + 关键帧），让模型真的"看得到"。任何失败都静默降级。
-    frames_summary = {"on": want_frames, "with_video": 0, "cover_only": 0, "none": 0, "ffmpeg": bool(find_ffmpeg())}
+    # ⭐ 给入选候选抓画面（封面+自适应关键帧）和台词（字幕/Whisper），让模型真的"看得到、听得到"。任何失败都静默降级。
+    frames_summary = {"on": want_frames, "with_video": 0, "cover_only": 0, "none": 0, "ffmpeg": bool(find_ffmpeg()),
+                      "spoken": spoken_summary}
     if want_frames:
         with creq.Session(impersonate="chrome") as fs:
             fs.headers.update({
@@ -384,20 +631,26 @@ def main():
             })
             for r in top:
                 a = bag.get(str(r["aweme_id"])) or {}
-                frames = grab_frames(fs, r, a, True, frame_count)
+                frames, spoken, spoken_kind = grab_frames(fs, r, a, True, cfg)
                 r.pop("_video_url_ok", None); r.pop("_ffmpeg", None)
                 has_video = any(os.path.basename(p).startswith("frame_") for p in frames)
                 r["frames"] = frames
                 r["frames_kind"] = "video" if has_video else ("cover" if frames else "none")
+                r["spoken"] = spoken
+                r["spoken_kind"] = spoken_kind
                 frames_summary["with_video" if has_video else ("cover_only" if frames else "none")] += 1
+                spoken_summary[spoken_kind or "none"] = spoken_summary.get(spoken_kind or "none", 0) + 1
                 time.sleep(random.uniform(1.5, 4.0))   # 下载之间拟人停顿，别像批量爬虫
     else:
         for r in top:
             r["frames"] = []
             r["frames_kind"] = "off"
+            r["spoken"] = ""
+            r["spoken_kind"] = "off"
 
     print("采集：%s" % json.dumps(meta, ensure_ascii=False))
-    print("画面：%s" % json.dumps(frames_summary, ensure_ascii=False))
+    print("画面：%s" % json.dumps({k: v for k, v in frames_summary.items() if k != "spoken"}, ensure_ascii=False))
+    print("台词：%s" % json.dumps(spoken_summary, ensure_ascii=False))
     print("硬筛跳过：%s（阈值 文案≥%d 字 / 评论≥%d）" % (
         json.dumps(dropped, ensure_ascii=False), limits["minDescLen"], limits["minComments"]))
     print("去重后候选 %d 条，取前 %d" % (len(rows), len(top)))

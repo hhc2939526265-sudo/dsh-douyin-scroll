@@ -910,18 +910,49 @@ window.__ModuleLoader__.load({
           h('div', { 'data-dy-sub': '', style: { marginTop: '6px', opacity: '.78' } },
             '④ 在评论区 @ 老大：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。')),
 
-        /* ── 👀 看画面（v0.3.9）：让大肥鱼真的看到视频，再决定喜不喜欢 ── */
+        /* ── 👀 看画面（v0.3.9）+ 自适应抽帧 / 语音（v0.4.0） ── */
         h('div', { 'data-dy-card': '' },
-          h('div', { 'data-dy-title': '' }, '👀 让大肥鱼看视频画面'),
+          h('div', { 'data-dy-title': '' }, '👀 让大肥鱼看视频画面、听台词'),
           h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
-            '开着时，每条入选视频会抓高清封面 + 关键帧（需要本机有 ffmpeg；没有就只看高清封面，体检会提示）。'
-            + '大肥鱼先看画面、再结合数据判断喜不喜欢、要不要分享给你。'),
+            '开着时，每条入选视频抓高清封面 + 按视频时长自适应抽帧（约每几秒一帧、设上限，长视频看得更全又不浪费 token）。'
+            + '台词优先取抖音官方字幕；没有字幕且装了本地 Whisper 时才本地转写（默认关，重依赖）。'
+            + '需要本机 ffmpeg（没有就只看封面、体检会提示）。'),
           engToggle('watchFrames', '抓封面 + 关键帧（推荐开）',
             cfg.watchFrames
-              ? '✅ 开着：看得到封面和视频开头/中间/结尾的画面，判断更像真人。'
+              ? '✅ 开着：看得到封面和视频开头到结尾的画面，判断更像真人。'
               : '关着：只看文案和数字，不看画面。',
             cfg.watchFrames, { onLabel: '✅ 已打开看画面', offLabel: '已关闭看画面' }),
-          engNum('frameCount', '每条抽几个关键帧（1–6，默认 3；封面始终抓）', 1, 6, (n) => `每条抽 ${n} 个关键帧`)),
+          engNum('frameTargetSec', '每多少秒抽一帧（2–8 秒，默认 3；越小越全、越费 token）', 2, 8, (n) => `每 ${n} 秒一帧`),
+          engNum('frameMax', '每条视频关键帧上限（4–20，默认 12，封顶控 token）', 4, 20, (n) => `最多 ${n} 帧`),
+          engNum('frameWidth', '关键帧宽度（320 / 480 / 640 / 720，默认 640；填别的会归 640）', 320, 720, (n) => `帧宽 ${n}px`),
+          engNum('frameCount', '时长未知时的兜底帧数（2–12，默认 3；正常视频按上面的秒数自适应）', 2, 12, (n) => `兜底 ${n} 帧`),
+          engToggle('useOfficialSubtitle', '优先用抖音官方字幕（推荐开，最省最稳）',
+            cfg.useOfficialSubtitle !== false ? '✅ 开着：有官方字幕就直接用，不额外跑模型。' : '关着：不读官方字幕。',
+            cfg.useOfficialSubtitle !== false, { onLabel: '✅ 已启用官方字幕', offLabel: '已关闭官方字幕' }),
+          engToggle('useAsr', '没字幕时用本地 Whisper 转写（可选，默认关）',
+            cfg.useAsr
+              ? '✅ 开着：无字幕视频会用本地 faster-whisper 转写（CPU 较慢、首次下载模型；需 pip install faster-whisper）。'
+              : '关着（推荐）：只用官方字幕，没字幕就老实标注「无台词」，不假装听懂。',
+            cfg.useAsr, { onLabel: '✅ 已开启本地 Whisper', offLabel: '已关闭本地 Whisper（默认）' }),
+          engNum('spokenMaxChars', '每条台词最多保留多少字（0–2000，默认 600，控 token）', 0, 2000, (n) => `台词最多 ${n} 字`)),
+
+        /* ── 🐟 表情包（v0.4.0）：收集 + 安全审核 + 发表 ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-title': '' }, '🐟 表情包（自己收集 · 安全审核后再发）'),
+          h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
+            '大肥鱼会从评论区和聊天里收集表情。新表情先由它自己看图审核：只放行可爱 / 萌 / 抽象 / 大肥鱼 / 治愈这类无不良的，'
+            + '色情、暴力、血腥、恐怖、恶心、违法、涉政、辱骂、未成年向一律拦掉。评论可发平台贴纸（私信发图 web 端不保证）。'
+            + '待审/已审表情可用 douyin_sticker_list、douyin_sticker_review 查看与拍板。'),
+          engToggle('collectSticker', '自动收集看到的表情（推荐开）',
+            cfg.collectSticker !== false ? '✅ 开着：评论/聊天里看到的表情会进库，先待审。' : '关着：不收集任何表情。',
+            cfg.collectSticker !== false, { onLabel: '✅ 已开启表情收集', offLabel: '已关闭表情收集' }),
+          engToggle('useSticker', '允许在评论区发表情（默认关，先收集审核够了再开）',
+            cfg.useSticker ? '✅ 开着：可以在评论里发表情（同样受风控节奏和每日上限约束）。' : '关着（默认）：只收集，不往外发。',
+            cfg.useSticker, { onLabel: '✅ 已允许发表情', offLabel: '已禁止发表情（默认）' }),
+          engToggle('stickerSafeOnly', '只发审核通过的安全表情（强烈建议开）',
+            cfg.stickerSafeOnly !== false ? '✅ 开着：只有审核通过的表情才发得出去。' : '⚠️ 关着：待审表情也可能被发（不建议）。',
+            cfg.stickerSafeOnly !== false, { onLabel: '✅ 已锁定只发安全表情', offLabel: '⚠️ 未锁定安全表情' }),
+          engNum('stickerPerDay', '每天最多发几个表情（0–30，默认 5）', 0, 30, (n) => `每天最多 ${n} 个表情`)),
 
         /* ── 🛡️ 降风险控（v0.3.9）：拟人节奏 / 夜间静默 / 上限 / 养号 / 熔断 ── */
         h('div', { 'data-dy-card': '' },

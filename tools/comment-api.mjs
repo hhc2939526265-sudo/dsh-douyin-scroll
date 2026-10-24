@@ -42,6 +42,8 @@ const REPLY = String(argOf('--reply', '')).trim()
 const ROOT = String(argOf('--root', '')).trim()
 const FILE = String(argOf('--file', '')).trim()
 const TEXT = FILE ? readFileSync(FILE, 'utf8').trim() : String(argOf('--text', '')).trim()
+// ⭐ v0.4.0 贴纸评论：传平台贴纸 id（表情库 sticker_id）；此时 text 可留空（贴纸即内容）
+const STICKER = String(argOf('--sticker', '')).trim()
 
 /**
  * 🔴 2026-10-22：这里以前**静默忽略** `--mention-*`（根本不读这几个参数）。
@@ -62,7 +64,7 @@ const wantsMention = Boolean(MENTION.name || MENTION.uid || MENTION.secUid)
 const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode = o.ok ? 0 : 1 }
 
 if (!AWEME) { out({ ok: false, error: '缺 --aweme' }); process.exit(1) }
-if (!TEXT) { out({ ok: false, error: '正文是空的' }); process.exit(1) }
+if (!TEXT && !STICKER) { out({ ok: false, error: '正文是空的' }); process.exit(1) }
 if (TEXT.length > 500) { out({ ok: false, error: `正文太长（${TEXT.length} 字），抖音评论放不下` }); process.exit(1) }
 if (wantsMention) {
   out({
@@ -209,7 +211,7 @@ try {
     var url = '/aweme/v1/web/comment/publish/?' + qs(Object.assign({}, COMMON, { app_name:'aweme' }));
     var body = Object.assign({}, COMMON, {
       aweme_id: AWEME, text: TEXT, text_extra: '[]',
-      aweme_type: '0', channel_id: '0', city: '', sticker_id: '', is_fold: '0'
+      aweme_type: '0', channel_id: '0', city: '', sticker_id: STICKER || '', is_fold: '0'
     });
     // ⭐ 只有回复场景才带这两个字段；而且**分工不同**
     //    reply_id       = 楼根（level1 的 cid）—— 决定落进哪栋楼

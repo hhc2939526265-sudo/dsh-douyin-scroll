@@ -149,6 +149,15 @@ def main() -> int:
             out.append(row("ffmpeg（看视频关键帧）", "warn", "没装（只看高清封面，不抓关键帧）",
                            "装系统 ffmpeg，或在 venv 里 pip install imageio-ffmpeg"))
 
+    # 10 faster-whisper（v0.4.0 语音识别：完全可选，默认关）
+    try:
+        import faster_whisper  # noqa: F401
+        out.append(row("本地语音识别 Whisper", "ok", "faster-whisper 已就绪"))
+    except Exception:
+        out.append(row("本地语音识别 Whisper", "warn",
+                       "没装（默认用官方字幕；想给无字幕视频也转写再装）",
+                       "在 venv 里 pip install faster-whisper，并在设置页打开本地 Whisper 转写"))
+
     bad = [r for r in out if r["state"] == "bad"]
     if as_json:
         print(json.dumps({"ok": not bad, "items": out}, ensure_ascii=False, indent=2))
