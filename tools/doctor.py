@@ -132,6 +132,23 @@ def main() -> int:
     else:
         out.append(row("关键脚本", "ok", f"{len(need)} 个都在"))
 
+    # 9 ffmpeg（v0.3.9 看画面：没有也能跑，只看高清封面 → warn 不是 bad）
+    ff = shutil.which("ffmpeg")
+    if ff:
+        out.append(row("ffmpeg（看视频关键帧）", "ok", ff))
+    else:
+        io_path = ""
+        try:
+            import imageio_ffmpeg  # type: ignore
+            io_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            io_path = ""
+        if io_path:
+            out.append(row("ffmpeg（看视频关键帧）", "ok", "来自 imageio-ffmpeg：" + io_path))
+        else:
+            out.append(row("ffmpeg（看视频关键帧）", "warn", "没装（只看高清封面，不抓关键帧）",
+                           "装系统 ffmpeg，或在 venv 里 pip install imageio-ffmpeg"))
+
     bad = [r for r in out if r["state"] == "bad"]
     if as_json:
         print(json.dumps({"ok": not bad, "items": out}, ensure_ascii=False, indent=2))

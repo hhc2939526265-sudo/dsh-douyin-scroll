@@ -28,6 +28,7 @@ forward-pick.json
 forward-msg.txt
 engage.json
 tastes-inbox.jsonl
+ratelimit.json
 *.log
 
 chrome-profile/
@@ -64,3 +65,10 @@ desktop.ini
 # ─────────────────────────────────────────────────────────────
 _scratch/
 *.png
+
+# ─────────────────────────────────────────────────────────────
+# v0.3.9 抓帧图片（运行时落在家目录 frames/，这里防手滑拖进包）
+# ─────────────────────────────────────────────────────────────
+frames/
+*.jpg
+*.tgz

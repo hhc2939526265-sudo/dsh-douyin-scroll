@@ -106,6 +106,37 @@ if (home) {
   else row('人设', 'warn', '一份都没有', '插件包不完整，重装')
 }
 
+/* ── 10. ffmpeg（v0.3.9 看画面：没有也能跑，只看高清封面） ── */
+{
+  const probe = (cmd, args) => {
+    try {
+      const r = spawnSync(cmd, args, { encoding: 'utf8' })
+      if (r.status === 0) return (r.stdout || '').split('\n')[0].trim()
+    } catch { /* 找不到 */ }
+    return ''
+  }
+  const sysFf = probe('ffmpeg', ['-version'])
+  if (sysFf) {
+    row('ffmpeg（看视频关键帧）', 'ok', sysFf)
+  } else if (home) {
+    // 没有系统 ffmpeg，再看 venv 里有没有可选的 imageio-ffmpeg
+    const venvPy = join(home, '.venv', 'bin', 'python')
+    const venvPyWin = join(home, '.venv', 'Scripts', 'python.exe')
+    const py = existsSync(venvPyWin) ? venvPyWin : (existsSync(venvPy) ? venvPy : '')
+    let ioPath = ''
+    if (py) {
+      const r = spawnSync(py, ['-c', 'import imageio_ffmpeg,sys;sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())'], { encoding: 'utf8' })
+      if (r.status === 0 && (r.stdout || '').trim()) ioPath = r.stdout.trim()
+    }
+    if (ioPath) row('ffmpeg（看视频关键帧）', 'ok', '来自 imageio-ffmpeg：' + ioPath)
+    else row('ffmpeg（看视频关键帧）', 'warn', '没装（只看高清封面，不抓关键帧）',
+      '装系统 ffmpeg（推荐），或在 venv 里装可选依赖 imageio-ffmpeg；装完重启插件')
+  } else {
+    row('ffmpeg（看视频关键帧）', 'warn', '没装（只看高清封面，不抓关键帧）',
+      '装系统 ffmpeg（推荐）或在 venv 里装可选依赖 imageio-ffmpeg')
+  }
+}
+
 /* ── 汇总 ── */
 const bad = items.filter((r) => r.state === 'bad')
 const warn = items.filter((r) => r.state === 'warn')

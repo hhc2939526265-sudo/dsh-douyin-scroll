@@ -228,6 +228,8 @@ window.__ModuleLoader__.load({
       const [manualDm, setManualDm] = React.useState(null)
       // 每天挑几条（输入框草稿）
       const [perDayDraft, setPerDayDraft] = React.useState(null)
+      // 每轮最多刷几条（v0.3.9）
+      const [maxPerRunDraft, setMaxPerRunDraft] = React.useState(null)
       // 记忆统计
       const [mem, setMem] = React.useState(null)
       // 消息（收件箱）：评论区 @ 我 + 谁私信我
@@ -300,6 +302,22 @@ window.__ModuleLoader__.load({
             onClick: async () => {
               const n = Math.max(min, Math.min(Number(engDraft[key]) || 0, max))
               await patch({ [key]: n }, done(n)); setEngDraft({ ...engDraft, [key]: undefined })
+            },
+          }, '保存'))
+      /* 文本字段（如夜间静默时段 HH:MM），原样存，后端会校验格式 */
+      const engText = (key, label, ph, done) =>
+        h('div', { 'data-dy-row': '' },
+          h('span', { 'data-dy-sub': '', style: { flex: '1' } }, label),
+          h('input', {
+            'data-dy-input': '', style: { width: '90px' }, type: 'text', placeholder: ph,
+            value: engDraft[key] !== undefined ? engDraft[key] : String(cfg[key] ?? ''),
+            onChange: (e) => setEngDraft({ ...engDraft, [key]: e.target.value }),
+          }),
+          h('button', {
+            'data-dy-mini': '', disabled: engDraft[key] === undefined || busy === 'patch',
+            onClick: async () => {
+              const v = String(engDraft[key] || '').trim()
+              await patch({ [key]: v }, done(v)); setEngDraft({ ...engDraft, [key]: undefined })
             },
           }, '保存'))
 
@@ -856,14 +874,14 @@ window.__ModuleLoader__.load({
             cfg.autonomousLearn, { onLabel: '✅ 已打开自主学习', offLabel: '已关闭自主学习' }),
 
           h('div', { style: { height: '8px' } }),
-          engToggle('shareToOwner', '① 把喜欢的私信分享给主人',
+          engToggle('shareToOwner', '① 把喜欢的私信分享给老大',
             cfg.shareToOwner
               ? '✅ 开着：从推荐里挑自己最想安利的发分享卡片（不是每条都发）。'
               : '关着：喜欢的只写进报告。',
             cfg.shareToOwner,
             { disabled: !cfg.autoSend || !cfg.dmToId, onLabel: '✅ 已打开私信分享', offLabel: '已关闭私信分享' }),
-          !cfg.dmToId ? h('div', { 'data-dy-sub': '' }, '（先在下面「私信发给谁」选好主人主号）') : null,
-          engNum('sharePerDay', '每天最多分享给主人几条（0–30，0=关）', 0, 30, (n) => `每天最多分享 ${n} 条`),
+          !cfg.dmToId ? h('div', { 'data-dy-sub': '' }, '（先在下面「私信发给谁」选好老大主号）') : null,
+          engNum('sharePerDay', '每天最多分享给老大几条（0–30，0=关）', 0, 30, (n) => `每天最多分享 ${n} 条`),
 
           h('div', { style: { height: '8px' } }),
           engToggle('proactiveComment', '② 主动评论（不是每条都评）',
@@ -890,7 +908,65 @@ window.__ModuleLoader__.load({
             cfg.replyKindOnly,
             { disabled: !cfg.autoSend || !cfg.autoReply, onLabel: '✅ 已开启善意过滤', offLabel: '已关闭善意过滤' }),
           h('div', { 'data-dy-sub': '', style: { marginTop: '6px', opacity: '.78' } },
-            '④ 在评论区 @ 主人：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。')),
+            '④ 在评论区 @ 老大：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。')),
+
+        /* ── 👀 看画面（v0.3.9）：让大肥鱼真的看到视频，再决定喜不喜欢 ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-title': '' }, '👀 让大肥鱼看视频画面'),
+          h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
+            '开着时，每条入选视频会抓高清封面 + 关键帧（需要本机有 ffmpeg；没有就只看高清封面，体检会提示）。'
+            + '大肥鱼先看画面、再结合数据判断喜不喜欢、要不要分享给你。'),
+          engToggle('watchFrames', '抓封面 + 关键帧（推荐开）',
+            cfg.watchFrames
+              ? '✅ 开着：看得到封面和视频开头/中间/结尾的画面，判断更像真人。'
+              : '关着：只看文案和数字，不看画面。',
+            cfg.watchFrames, { onLabel: '✅ 已打开看画面', offLabel: '已关闭看画面' }),
+          engNum('frameCount', '每条抽几个关键帧（1–6，默认 3；封面始终抓）', 1, 6, (n) => `每条抽 ${n} 个关键帧`)),
+
+        /* ── 🛡️ 降风险控（v0.3.9）：拟人节奏 / 夜间静默 / 上限 / 养号 / 熔断 ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-title': '' }, '🛡️ 降风险控（防封号）'),
+          h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
+            '让行为节奏像真人：动作间隔随机、连做会休息、深夜不发、新号先养、撞验证码就熔断。'
+            + '所有对外动作（评论/回复/@/私信/分享）都过这道闸，关不掉。'),
+          (() => {
+            const rl = st && st.ratelimit
+            if (!rl) return h('div', { 'data-dy-sub': '' }, '（状态刷新中…）')
+            const blockedTxt = rl.blocked === 'hard' ? '🔴 硬熔断（撞验证码/登录失效）'
+              : rl.blocked === 'cooldown' ? '🟠 限流冷却中'
+                : rl.inQuiet ? '🌙 夜间静默中' : '🟢 正常'
+            return h('div', { 'data-dy-kv': '', style: { marginBottom: '8px' } },
+              h('div', {}, '状态：' + blockedTxt + (rl.nurturing ? '　·　🐣 养号期（额度减半、间隔拉长）' : '')),
+              h('div', {}, `今天对外动作：${rl.dayUsed} / ${rl.dayMax}　·　这一小时：${rl.hourUsed} / ${rl.hourMax}　·　连续失败：${rl.consecFail}`),
+              rl.blocked
+                ? h('div', { 'data-dy-row': '', style: { marginTop: '6px' } },
+                  h('span', { 'data-dy-sub': '', style: { flex: '1' } },
+                    rl.blocked === 'hard' ? '确认账号没问题（验证码已过/登录正常）后，可手动解除熔断。' : '确认不是真的限流后，可手动解除冷却。'),
+                  h('button', {
+                    'data-dy-btn': '', 'data-primary': '', disabled: busy === 'patch',
+                    onClick: async () => {
+                      setBusy('patch')
+                      try { const r = await jpost('/ratelimit/reset', {}); if (r && r.ratelimit) setSt({ ...st, ratelimit: r.ratelimit }); say('已解除熔断，从现在起恢复外发', 'good') }
+                      catch (e) { say('解除失败：' + String((e && e.message) || e), 'warn') }
+                      finally { setBusy('') }
+                    },
+                  }, '解除熔断'))
+                : null)
+          })(),
+          engToggle('humanMode', '拟人节奏（随机间隔 / 连做长休，强烈建议开）',
+            cfg.humanMode ? '✅ 开着：间隔随机抖动、连做几条会自动休息，不像机器人。' : '⚠️ 关着：固定节奏，更容易被识别。',
+            cfg.humanMode, { onLabel: '✅ 已打开拟人节奏', offLabel: '已关闭拟人节奏' }),
+          engToggle('safeQuiet', '夜间静默（深夜不主动对外发）',
+            cfg.safeQuiet ? `✅ 开着：${cfg.quietStart || '23:00'}–${cfg.quietEnd || '08:00'} 不主动发。` : '关着：深夜也可能发（不建议）。',
+            cfg.safeQuiet, { onLabel: '✅ 已打开夜间静默', offLabel: '已关闭夜间静默' }),
+          engText('quietStart', '夜间开始（HH:MM）', '23:00', (v) => `夜间静默从 ${v} 开始`),
+          engText('quietEnd', '夜间结束（HH:MM）', '08:00', (v) => `夜间静默到 ${v} 结束`),
+          engNum('maxActionsPerHour', '每小时对外动作上限（1–30，默认 8）', 1, 30, (n) => `每小时最多 ${n} 个动作`),
+          engNum('maxActionsPerDay', '每天对外动作上限（1–100，默认 20）', 1, 100, (n) => `每天最多 ${n} 个动作`),
+          engToggle('nurtureMode', '新号养号期（前几天自动减半、拉长间隔）',
+            cfg.nurtureMode ? `✅ 开着：新号前 ${cfg.nurtureDays ?? 7} 天更克制。` : '关着：新号一上来就按正常频率（不建议）。',
+            cfg.nurtureMode, { onLabel: '✅ 已打开养号期', offLabel: '已关闭养号期' }),
+          engNum('nurtureDays', '养号期天数（0–30，默认 7）', 0, 30, (n) => `养号 ${n} 天`)),
 
         /* ── 开始使用：三步装机 + 扫码登录 ──
          * 🔴 2026-10-22：以前这里只写一句「命令行跑 node tools/qr-login.mjs start」——
@@ -956,7 +1032,7 @@ window.__ModuleLoader__.load({
           h('div', { 'data-dy-row': '' },
             h('div', { 'data-dy-grow': '' },
               h('div', { 'data-dy-title': '' }, '出问题了？'),
-              h('div', { 'data-dy-sub': '' }, '点一下，9 项环境逐个查，哪项红了直接告诉你怎么办')),
+              h('div', { 'data-dy-sub': '' }, '点一下，10 项环境逐个查，哪项红了直接告诉你怎么办')),
             h('button', { 'data-dy-btn': '', disabled: busy === 'doctor', onClick: onDoctor },
               busy === 'doctor' ? '查着…' : '检查环境')),
           doctor
@@ -1162,6 +1238,24 @@ window.__ModuleLoader__.load({
                 const n = Math.max(0, Math.min(Number(perDayDraft) || 0, 300))
                 await patch({ perDay: n }, `每天最多 ${n} 条`)
                 setPerDayDraft(null)
+              },
+            }, '保存')),
+          h('div', { 'data-dy-row': '' },
+            h('input', {
+              'data-dy-time': '', type: 'number', min: 1, max: 30,
+              style: { width: '72px' },
+              value: String(maxPerRunDraft !== null ? maxPerRunDraft : (cfg.maxPerRun != null ? cfg.maxPerRun : 12)),
+              onChange: (e) => setMaxPerRunDraft(e.target.value),
+            }),
+            h('span', { 'data-dy-sub': '' }, '条 / 轮（每轮最多刷几条、抓几条约画面，1–30，默认 12）'),
+            h('div', { 'data-dy-grow': '' }),
+            h('button', {
+              'data-dy-mini': '', 'data-primary': '',
+              disabled: Boolean(busy) || maxPerRunDraft === null,
+              onClick: async () => {
+                const n = Math.max(1, Math.min(Number(maxPerRunDraft) || 12, 30))
+                await patch({ maxPerRun: n }, `每轮最多刷 ${n} 条`)
+                setMaxPerRunDraft(null)
               },
             }, '保存')),
           h('div', { 'data-dy-row': '' },

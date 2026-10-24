@@ -1,6 +1,6 @@
 {
   "name": "dsh-douyin-scroll",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "DSH 插件：拟人小账号「大肥鱼」自己刷抖音、自己学习养审美；挑到喜欢的私信分享卡片给主人 / 评论区 @ 主人，可主动评论（非每条都评）、只善意回复（同人每天≤2）。自带 MCP server，别的 agent 工具也能接。",
   "keywords": [
     "dsh",

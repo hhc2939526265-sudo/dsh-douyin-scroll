@@ -29,7 +29,7 @@ console.log('1. 文件清单')
 const required = [
   'package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'requirements.txt',
   'lib/hostdeps.mjs', 'lib/state.mjs', 'lib/credential.mjs', 'lib/notify.mjs', 'lib/toast.mjs', 'lib/uvfetch.mjs',
-  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs',
+  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs', 'lib/ratelimit.mjs',
   'prompts/duty.md', 'prompts/persona.default.md', 'prompts/sample-candidates.json',
   // 给别的 AI / MCP 用的那一层
   'AI-USAGE.md', 'tools/mcp-server.mjs', 'tools/doctor.mjs', 'check-client.mjs',
@@ -539,8 +539,10 @@ try {
     else bad('AI-USAGE.md 没写「先卡片，后文字」—— 别的 AI 会按错的顺序发')
     if (/confirm: true/.test(d) || /confirm:true/.test(d)) ok('AI-USAGE.md 写明了 confirm 闸')
     else bad('AI-USAGE.md 没写 confirm 闸 —— 别的 AI 会直接发')
-    if (/不读画面|ASR/.test(d)) ok('AI-USAGE.md 写明了「看不到画面」')
-    else bad('AI-USAGE.md 没写「看不到画面」—— 别的 AI 会以为它能看视频')
+    if (/frames|关键帧|封面/.test(d)) ok('AI-USAGE.md 写明了「能看画面：封面 + 关键帧 frames」')
+    else bad('AI-USAGE.md 没写「能看画面 frames」—— 别的 AI 会以为它看不到视频、不敢据画面判断')
+    if (/听不到声音|不做 ASR|没有字幕|不做ASR/.test(d)) ok('AI-USAGE.md 写明了「听不到声音、不做 ASR」边界')
+    else bad('AI-USAGE.md 没写「听不到声音/不做 ASR」边界 —— 别的 AI 可能假装听懂台词')
   } else bad('缺 AI-USAGE.md —— 别的 AI 不知道怎么用')
 } catch (e) { bad(`MCP / 使用说明检查失败：${e.message}`) }
 
@@ -930,7 +932,7 @@ try {
   else bad('chatWatch 默认值不对 —— 使用者拍板过默认开')
   // 🔴 防倒退：DEFAULTS 表必须也带 chatWatch（2026-10-24 事故：只加了 zod 没加 DEFAULTS，
   //    clampPatch 只放行 DEFAULTS 里的键 ⇒ 面板开关点了没反应）
-  if (/DEFAULTS = \{[\s\S]{0,900}?chatWatch: true/.test(idx)) ok('DEFAULTS 表带 chatWatch 且默认 true（面板的 patch 不会被 strip）')
+  if (/DEFAULTS = \{[\s\S]{0,2500}?chatWatch: true/.test(idx)) ok('DEFAULTS 表带 chatWatch 且默认 true（面板的 patch 不会被 strip）')
   else bad('DEFAULTS 表没有 chatWatch（或默认值不对）—— 面板开关会点了没反应')
   if (/chatWatchSec: z\.natural\(\)\.default\(30\)/.test(idx)) ok('看消息间隔默认 30 秒（使用者定的）')
   else bad('看消息间隔默认值不对')
@@ -1229,6 +1231,94 @@ else warn('没找到 Chrome / Edge / Chromium —— 发私信 / 卡片 / 评论
 const dsh = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['dsh'], { encoding: 'utf8' })
 if (dsh.status === 0) ok('dsh 在 PATH 里')
 else warn('dsh 不在 PATH —— 桌面版正常（插件会自动去应用目录找）；npm 装的请确认 PATH')
+
+/* ── 4q. v0.3.9：看画面 / 私信只对老大 / 官方卡片带评价 / 风控降险 ── */
+console.log('\n4q. v0.3.9 看画面·私信锁·风控')
+try {
+  const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  const mcp = readFileSync(join(here, 'tools', 'mcp-server.mjs'), 'utf8')
+  const cl = readFileSync(join(here, 'client.js'), 'utf8')
+  const persona = readFileSync(join(here, 'prompts', 'persona.default.md'), 'utf8')
+  const duty = readFileSync(join(here, 'prompts', 'duty.md'), 'utf8')
+  const fp = readFileSync(join(here, 'tools', 'forward-pick.py'), 'utf8')
+  const rlSrc = readFileSync(join(here, 'lib', 'ratelimit.mjs'), 'utf8')
+
+  // ① 风控模块：导出齐全 + host/MCP 都接线
+  for (const fn of ['checkGate', 'awaitGate', 'markAction', 'recordFailure', 'resetCircuit', 'rateStatus', 'humanGap']) {
+    if (rlSrc.includes(`export function ${fn}`) || rlSrc.includes(`export async function ${fn}`)) ok(`ratelimit 导出 ${fn}`)
+    else bad(`lib/ratelimit.mjs 缺导出 ${fn}`)
+  }
+  if (/from '\.\/lib\/ratelimit\.mjs'/.test(idx)) ok('host index.js 引用 lib/ratelimit.mjs')
+  else bad('host index.js 没接风控闸')
+  if (/from '\.\.\/lib\/ratelimit\.mjs'/.test(mcp)) ok('MCP server 引用 lib/ratelimit.mjs')
+  else bad('MCP server 没接风控闸（值班轮绕不过去）')
+
+  // ② 私信白名单：host + MCP 都有 owner_only / owner_not_set
+  if (/owner_only/.test(idx) && /owner_not_set/.test(idx)) ok('host 私信/分享锁死只对老大（owner_only / owner_not_set）')
+  else bad('host 缺私信白名单 owner_only/owner_not_set')
+  if (/owner_only/.test(mcp) && /owner_not_set/.test(mcp)) ok('MCP 私信/分享锁死只对老大')
+  else bad('MCP 缺私信白名单')
+
+  // ③ 视频链接必须走官方分享卡片（dm 里贴链接被拦）
+  if (/use_share_card/.test(idx) && /use_share_card/.test(mcp)) ok('host + MCP 拦正文视频链接、强制走官方分享卡片')
+  else bad('缺 use_share_card 拦截（会发出点不开的文字链接）')
+
+  // ④ 分享 / @ 必须带一句自己的看法
+  if (/need_reason/.test(idx) && /need_reason/.test(mcp)) ok('host + MCP 分享卡片 / @ 强制带评价（need_reason）')
+  else bad('缺 need_reason 强制评价')
+
+  // ⑤ 看画面：forward-pick 抓帧 → host/MCP 透传 → 证据包写 frames → 模型工作区可读
+  if (/grab_frames|def grab_frames/.test(fp) && /frames/.test(fp)) ok('forward-pick.py 抓封面+关键帧（frames）')
+  else bad('forward-pick.py 没有抓帧逻辑')
+  if (/frames/.test(idx) && /buildEvidence[\s\S]{0,4000}frames/.test(idx)) ok('host 透传 frames 并写进证据包')
+  else bad('host 没把 frames 透传/写进证据包')
+  if (/frames/.test(mcp)) ok('MCP douyin_forward 透传 frames')
+  else bad('MCP 没透传 frames')
+  if (/先.*Read.*frames|把它的 `frames`|逐张打开看|frames/.test(duty)) ok('duty 要求判前先看 frames')
+  else bad('duty 没要求先看 frames')
+
+  // ⑥ 称呼统一为「老大」（persona 里允许出现"主人"是为了说明"主人/老大是同一个人"，
+  //    但身份句必须是"只能叫老大"；duty 正文不再出现"主人"）
+  if (/老大/.test(persona) && /只能叫老大/.test(persona) && /老大/.test(duty) && !/主人/.test(duty)) {
+    ok('称呼统一为「老大」：persona 身份句 + duty 正文无「主人」残留')
+  } else bad('称呼没统一（persona 应"只能叫老大"，duty 不应残留"主人"）')
+  if (/主人.{0,8}老大|老大.{0,8}主人|说主人|叫主人|你家主人/.test(persona)) ok('persona 写明「主人/老大」指同一个人')
+  else bad('persona 没说明「主人/老大」是同一个人')
+
+  // ⑦ 风控/画面配置键默认值在 host schema
+  for (const k of ['watchFrames', 'frameCount', 'humanMode', 'safeQuiet', 'quietStart', 'quietEnd',
+    'maxActionsPerHour', 'maxActionsPerDay', 'nurtureMode', 'nurtureDays', 'maxPerRun']) {
+    if (idx.includes(k)) ok(`host 配置项 ${k}`)
+    else bad(`host 缺配置项 ${k}`)
+  }
+  // 面板有风控卡 + 解除熔断 + 看画面卡
+  if (/ratelimit\/reset/.test(idx) && /解除熔断/.test(cl)) ok('host 提供解除熔断接口，面板有「解除熔断」按钮')
+  else bad('缺解除熔断接口/按钮')
+  if (/看视频画面|看画面/.test(cl) && /frameCount/.test(cl) && /降风险控/.test(cl)) ok('面板有「看画面」「降风险控」设置卡')
+  else bad('面板缺看画面/风控设置卡')
+
+  // ⑧ 动态跑一遍风控：正常放行 → 撞验证码硬熔断 → 手动解除 → 每日上限
+  const script = `import { pathToFileURL } from 'node:url'; import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
+const m = await import(pathToFileURL(${JSON.stringify(join(here, 'lib', 'ratelimit.mjs'))}).href);
+const h = mkdtempSync(join(tmpdir(), 'rl-'));
+const O = { safeQuiet:false, humanMode:false, nurtureMode:false, maxActionsPerHour:8, maxActionsPerDay:20 };
+const g1 = m.checkGate(h,'comment',O).ok;
+const f = m.recordFailure(h,'comment','出现验证码请完成滑块',O).hard;
+const g2 = m.checkGate(h,'comment',O).reason;
+const rs = m.resetCircuit(h);
+const g3 = m.checkGate(h,'comment',O).ok;
+for (let i=0;i<20;i++) m.markAction(h,'dm',O);
+const g4 = m.checkGate(h,'dm',O).reason;
+console.log('RLRESULT ' + JSON.stringify({g1,f,g2,rs,g3,g4}));`
+  const rr = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' })
+  const m = String(rr.stdout || '').match(/RLRESULT (\{.*\})/)
+  if (rr.status === 0 && m) {
+    const r = JSON.parse(m[1])
+    if (r.g1 === true && r.f === true && r.g2 === 'hard_circuit' && r.rs === true && r.g3 === true && r.g4 === 'day_cap') {
+      ok('风控行为正确：放行→撞验证码硬熔断→解除恢复→每日上限拦截')
+    } else bad(`风控行为不符：${m[1]}`)
+  } else bad(`风控动态测试没跑通：${String(rr.stderr || rr.stdout || '').slice(0, 200)}`)
+} catch (e) { bad(`v0.3.9 检查失败：${e.message}`) }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) {

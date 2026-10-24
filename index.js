@@ -42,6 +42,10 @@ import {
   canShare, countShare, classifyReply, noteSkipped,
 } from './lib/engage.mjs'
 import { tasteProfileText, summarizeTaste, appendTaste, resetTastes } from './lib/tastes.mjs'
+// ⭐ 降风险控（2026-10-24）：拟人节奏 / 抖动 / 每小时·每天上限 / 夜间静默 / 养号 / 熔断。host 与 MCP 共用。
+import {
+  awaitGate, checkGate, markAction, recordFailure, resetCircuit, rateStatus,
+} from './lib/ratelimit.mjs'
 
 export const name = 'douyin-scroll'
 export const inject = ['webServer', 'tools', 'settings']
@@ -138,14 +142,14 @@ export const Config = !z ? undefined : z.object({
   httpCommentUrl: z.string().default('').extra('volatile', true),
   /**
    * ⭐⭐ 大肥鱼自主行为（2026-10-24 使用者定稿）：
-   *   插件不是"替主人筛选的秘书"，而是让 DSH 自己刷、自己学、自己表达的拟人账号。
-   *   登录的是"AI 小号"，主人主号是接收分享 / 被 @ 的对象（两账号，见 dmToId / commentSelfName）。
+   *   插件不是"替老大筛选的秘书"，而是让 DSH 自己刷、自己学、自己表达的拟人账号。
+   *   登录的是"AI 小号"，老大主号是接收分享 / 被 @ 的对象（两账号，见 dmToId / commentSelfName）。
    */
   /** 自主学习：每轮把"为什么觉得好看"沉淀进口味画像，越刷越有自己的口味（默认开） */
   autonomousLearn: z.boolean().default(true).extra('volatile', true),
-  /** 看到喜欢的视频，自动私信分享卡片给主人（dmToId）——私密、只发给主人，默认开 */
+  /** 看到喜欢的视频，自动私信分享卡片给老大（dmToId）——私密、只发给老大，默认开 */
   shareToOwner: z.boolean().default(true).extra('volatile', true),
-  /** 每天最多私信分享几条给主人（默认 5，0 = 不自动分享） */
+  /** 每天最多私信分享几条给老大（默认 5，0 = 不自动分享） */
   sharePerDay: z.natural().default(5).extra('volatile', true),
   /** 主动给刷到的视频发评论（顶层普通评论、不带 @）——公开行为，默认关，打开才发 */
   proactiveComment: z.boolean().default(false).extra('volatile', true),
@@ -162,6 +166,35 @@ export const Config = !z ? undefined : z.object({
   replyPerPerson: z.natural().default(2).extra('volatile', true),
   /** 只回复善意 / 好回答的评论（恶意、抬杠、引战、引流、索要隐私一律不回；默认开） */
   replyKindOnly: z.boolean().default(true).extra('volatile', true),
+  /**
+   * ⭐⭐ 看视频画面（2026-10-24 使用者提出：要让 DSH 真的看到视频，才知道好不好、喜不喜欢）。
+   * 开着时，入选候选会抓高清封面 + 关键帧（有 ffmpeg 时从视频抽开头/中间/结尾），
+   * 写到 frames/<视频ID>/，值班那一轮用 Read 打开看，再结合数据判断。默认开；关掉只看文本。
+   */
+  watchFrames: z.boolean().default(true).extra('volatile', true),
+  /** 每条视频抽几个关键帧（1–6，默认 3；高清封面始终抓） */
+  frameCount: z.natural().default(3).extra('volatile', true),
+  /**
+   * ⭐⭐ 降风险控（2026-10-24 使用者提出：知道有封号风险，要一套降风险代码融进去）。
+   * 拟人节奏（随机间隔/抖动/连做长休）、每小时/每日硬上限、夜间静默、新号养号、
+   * 撞限流/验证码熔断，host 与 MCP 所有对外动作共用 lib/ratelimit.mjs 一道闸。
+   */
+  /** 拟人节奏：动作间隔随机抖动、连做几个后随机长休（默认开） */
+  humanMode: z.boolean().default(true).extra('volatile', true),
+  /** 夜间静默：深夜不主动对外发（默认开，时段见 quietStart/End） */
+  safeQuiet: z.boolean().default(true).extra('volatile', true),
+  /** 夜间静默开始（HH:MM，默认 23:00） */
+  quietStart: z.string().default('23:00').extra('volatile', true),
+  /** 夜间静默结束（HH:MM，默认 08:00，支持跨零点） */
+  quietEnd: z.string().default('08:00').extra('volatile', true),
+  /** 每小时对外动作硬上限（评论/回复/私信/分享/@ 合计，默认 8） */
+  maxActionsPerHour: z.natural().default(8).extra('volatile', true),
+  /** 每天对外动作硬上限（合计，默认 20；养号期自动下调） */
+  maxActionsPerDay: z.natural().default(20).extra('volatile', true),
+  /** 新号养号期：前 N 天自动降低配额、拉长间隔（默认开） */
+  nurtureMode: z.boolean().default(true).extra('volatile', true),
+  /** 养号期天数（默认 7） */
+  nurtureDays: z.natural().default(7).extra('volatile', true),
   /** ⭐⭐ 聊天盯梢（2026-10-24）：后台每 N 秒读一次私信对象的会话，有新消息就通知。
    *  来源：使用者当天实测的「会话模式」——30 秒一读、看见就回（实测响应 ~12 秒）。
    *  间隔默认 30 秒；读取走 HTTP 快路径（im-http.py，~1.1 秒/次、不启浏览器、身份铁闸）。 */
@@ -284,6 +317,11 @@ export function apply(ctx, config) {
     autonomousLearn: true, shareToOwner: true, sharePerDay: 5,
     proactiveComment: false, proactiveCommentPerDay: 3,
     autoReply: false, replyPerDay: 10, replyPerPerson: 2, replyKindOnly: true,
+    // ⭐ 看画面（2026-10-24）：抓封面+关键帧给模型看
+    watchFrames: true, frameCount: 3,
+    // ⭐ 降风险控（2026-10-24）：拟人节奏 / 夜间静默 / 每小时·每天上限 / 养号
+    humanMode: true, safeQuiet: true, quietStart: '23:00', quietEnd: '08:00',
+    maxActionsPerHour: 8, maxActionsPerDay: 20, nurtureMode: true, nurtureDays: 7,
     notifyMode: 'toast', webhookUrl: '', webhookPreset: 'custom',
     updateUrl: '',
     dmTo: '', dmToId: '',
@@ -343,6 +381,14 @@ export function apply(ctx, config) {
     if ('proactiveCommentPerDay' in p) p.proactiveCommentPerDay = Math.max(0, Math.min(Number(p.proactiveCommentPerDay) || 0, 30))
     if ('replyPerDay' in p) p.replyPerDay = Math.max(0, Math.min(Number(p.replyPerDay) || 0, 60))
     if ('replyPerPerson' in p) p.replyPerPerson = Math.max(0, Math.min(Number(p.replyPerPerson) || 0, 10))
+    // ⭐ 看画面 / 风控（2026-10-24）
+    if ('frameCount' in p) p.frameCount = Math.max(1, Math.min(Number(p.frameCount) || 3, 6))
+    if ('maxActionsPerHour' in p) p.maxActionsPerHour = Math.max(1, Math.min(Number(p.maxActionsPerHour) || 8, 30))
+    if ('maxActionsPerDay' in p) p.maxActionsPerDay = Math.max(1, Math.min(Number(p.maxActionsPerDay) || 20, 100))
+    if ('nurtureDays' in p) p.nurtureDays = Math.max(0, Math.min(Number(p.nurtureDays) || 7, 30))
+    const hmOk = /^([01]\d|2[0-3]):[0-5]\d$/
+    if ('quietStart' in p && !hmOk.test(String(p.quietStart))) p.quietStart = DEFAULTS.quietStart
+    if ('quietEnd' in p && !hmOk.test(String(p.quietEnd))) p.quietEnd = DEFAULTS.quietEnd
     for (const [k, vals] of Object.entries(ENUMS)) {
       if (k in p) p[k] = vals.includes(String(p[k])) ? String(p[k]) : DEFAULTS[k]
     }
@@ -713,6 +759,58 @@ export function apply(ctx, config) {
     } catch { /* 记不上不影响 */ }
   }
 
+  // ⭐⭐ v0.3.9 降风险控 + 私信铁闸（2026-10-24）========================================
+  // host 与 MCP 所有对外动作都走 lib/ratelimit.mjs 这同一道闸，绕不过去。
+  const rateOpts = () => ({
+    humanMode: cfg.humanMode !== false,
+    safeQuiet: cfg.safeQuiet !== false,
+    quietStart: String(cfg.quietStart || '23:00'),
+    quietEnd: String(cfg.quietEnd || '08:00'),
+    maxActionsPerHour: Number(cfg.maxActionsPerHour) || 8,
+    maxActionsPerDay: Number(cfg.maxActionsPerDay) || 20,
+    nurtureMode: cfg.nurtureMode !== false,
+    nurtureDays: Number(cfg.nurtureDays) || 7,
+  })
+  const RATE_NOTE = {
+    hard_circuit: '🔴 撞到验证码/登录失效/账号异常，已硬熔断，一段时间内停止一切外发（设置页可手动恢复）',
+    cooldown: '撞了限流或连续失败，冷却中，先停手别再发',
+    quiet_hours: '现在是夜间静默时段，不主动对外发（默认 23:00–08:00，设置页可改）',
+    day_cap: '今天对外动作已到上限，明天再发',
+    hour_cap: '这一小时动作太密，过会儿再发',
+  }
+  const rateBlocked = (g) => ({
+    ok: false, blocked: true, sent: false, reason: g.reason,
+    detail: g.detail || {}, waitMs: g.waitMs || 0,
+    note: RATE_NOTE[g.reason] || '风控闸拦住了，先别发',
+  })
+  /**
+   * ⭐ 私信铁闸（使用者要求）：只和老大一人收发。
+   * 目标 toId 必须等于设置里的 dmToId；没配置老大、或目标不是老大，一律拦下。
+   * 返回 null 表示放行，否则返回一个 blocked 结果。
+   */
+  const ownerOnlyGate = (toId) => {
+    const owner = String(cfg.dmToId || '').trim()
+    const target = String(toId || '').trim()
+    if (!owner) {
+      return { ok: false, blocked: true, reason: 'owner_not_set', sent: false,
+        error: '还没设置老大的稳定 ID（dmToId），不能给任何人发私信', hint: '在设置页填「老大的稳定 ID（sec_uid）」' }
+    }
+    if (!target) {
+      return { ok: false, blocked: true, reason: 'owner_not_set', sent: false,
+        error: '没有收件人，且未配置老大', hint: '在设置页填「老大的稳定 ID（sec_uid）」' }
+    }
+    if (target !== owner) {
+      return { ok: false, blocked: true, reason: 'owner_only', sent: false,
+        error: '私信锁死：只和老大一人收发，不发给其他任何人', detail: { target } }
+    }
+    return null
+  }
+  /** 发送器输出里识别 403/验证码/登录失效等信号，喂给风控（返回是否触发熔断） */
+  const rateFailFromText = (kind, ...parts) => {
+    const text = parts.map((p) => (typeof p === 'string' ? p : (p?.error || p?.stderr || (p == null ? '' : JSON.stringify(p))))).join(' ')
+    return recordFailure(stateDir, kind, text, rateOpts())
+  }
+
   /**
    * 三态回读：**别再只说 found / not found**。
    *   visible   —— 评论区里真的刷到了（按 cid 或正文片段）
@@ -877,7 +975,9 @@ export function apply(ctx, config) {
       }
       const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
       const py = existsSync(venvPy) ? venvPy : (cfg.pythonPath || 'python')
-      const r = spawnSync(py, [script], {
+      // ⭐ 每轮筛选取多少条用「每轮最多刷几条」（maxPerRun）；抓帧开关由 py 读 config.json（watchFrames/frameCount）
+      const limit = Math.max(1, Math.min(Number(cfg.maxPerRun) || 12, 30))
+      const r = spawnSync(py, [script, '--limit', String(limit)], {
         encoding: 'utf8',
         timeout: 240_000,
         env: pyEnv({ DOUYIN_HOME: stateDir }),
@@ -910,6 +1010,7 @@ export function apply(ctx, config) {
         ok: true,
         picked: rows.length,
         sources: picked.meta || [],
+        frames: picked.frames || { on: false },
         toast: toastRes,
         list: rows.map((x) => ({
           aweme_id: x.aweme_id,
@@ -923,6 +1024,9 @@ export function apply(ctx, config) {
           share_url: x.share_url,
           share_desc: x.share_desc,
           web_url: x.web_url,
+          // ⭐ 画面证据：相对插件家（值班轮工作区）的帧路径，模型用 Read 打开就能"看到"这条视频
+          frames: Array.isArray(x.frames) ? x.frames : [],
+          frames_kind: x.frames_kind || 'none',
         })),
       }
     },
@@ -949,15 +1053,28 @@ export function apply(ctx, config) {
       const to = String(args.to || cfg.dmTo || '').trim()
       const toId = String(args.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道发给谁', hint: '传 to / to_id，或在设置里填「私信发给谁」+「稳定 ID」' }
+      // ⭐ 私信铁闸（v0.3.9）：只允许发给老大，其它任何人一律拦（预览阶段就拦，趁早纠正）
+      const ownerBlock = ownerOnlyGate(toId)
+      if (ownerBlock) return ownerBlock
       let file = ''
       if (args.from_list) {
-        const n = String(Math.max(1, Math.min(Number(args.top) || 3, 5)))
-        const r1 = runNodeTool('mk-msg.mjs', [n], { timeout: 60_000 })
-        if (r1.status !== 0) return { ok: false, error: '生成清单正文失败', stderr: r1.stderr.slice(0, 300) }
-        file = join(stateDir, 'forward-msg.txt')
+        // ⭐ 需求③：分享视频必须走官方分享卡片，不能再用文字链接清单（抖音里点不开、也不算分享）
+        return {
+          ok: false, blocked: true, reason: 'use_share_card',
+          error: '要把视频给老大，请用 douyin_share_card（抖音官方分享卡片），不要再用 from_list 发文字链接清单',
+          hint: 'douyin_share_card({ aweme_id, reason:"我为什么觉得这条值得看", confirm:true })',
+        }
       }
       const text = String(args.text || '').trim()
       if (!file && !text) return { ok: false, error: '正文为空', hint: '传 text，或 from_list=true' }
+      // ⭐ 视频链接拦截：正文里塞了抖音视频地址 ⇒ 必须改成卡片（卡片才可点、才算分享）
+      if (/v\.douyin\.com|douyin\.com\/video|iesdouyin\.com\/share|\.iesdouyin\.net/i.test(text)) {
+        return {
+          ok: false, blocked: true, reason: 'use_share_card',
+          error: '正文里有抖音视频链接 —— 视频请走 douyin_share_card 官方分享卡片；这条文字只留「你对视频的看法」',
+          hint: '先 douyin_share_card({aweme_id, reason, confirm:true})，纯文字想法由它的 reason 带上',
+        }
+      }
       // 🔴 用户闸：没经本人当场同意，只回草稿，绝不发出
       if (args.confirm !== true) {
         let draft = text
@@ -968,6 +1085,11 @@ export function apply(ctx, config) {
           note: '没发送 —— 先把这段草稿给用户看，他点头后再用 confirm:true 调一次',
         }
       }
+      // ⭐ 风控闸（v0.3.9）：拟人节奏 / 夜间静默 / 上限 / 熔断
+      if (!args.dry) {
+        const g = await awaitGate(stateDir, 'dm', rateOpts())
+        if (!g.ok) return rateBlocked(g)
+      }
       const argv = []
       if (to) argv.push('--to', to)
       if (toId) argv.push('--to-id', toId)
@@ -976,7 +1098,12 @@ export function apply(ctx, config) {
       if (args.dry) argv.push('--dry')
       const r = runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
       const res = pickJson(r.stdout)
-      if (!res) return { ok: false, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
+      if (!res) { if (!args.dry) rateFailFromText('dm', r.stdout, r.stderr); return { ok: false, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) } }
+      if (res.sent && !args.dry) {
+        markAction(stateDir, 'dm', rateOpts())
+      } else if (!res.ok && !res.sent && !args.dry) {
+        rateFailFromText('dm', res, r.stdout, r.stderr)
+      }
       if (res.ok) log(`dm -> ${res.to || to}${res.to_sec_uid ? ' (' + res.to_sec_uid + ')' : ''}: ${res.sent ? '已发送' : res.dry ? 'dry-run' : '未发送'}（${res.len} 字）`)
       if (res.sent) noteDm('text', res.to_sec_uid || toId)
       // ⭐ 发出去的话要进记忆 —— 不然下次读私信会以为这句话是凭空出现的
@@ -1012,6 +1139,9 @@ export function apply(ctx, config) {
       const to = String(args.to || cfg.dmTo || '').trim()
       const toId = String(args.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道发给谁', hint: '传 to / to_id，或在设置里填「私信发给谁」+「稳定 ID」' }
+      // ⭐ 私信铁闸（v0.3.9）：分享卡片也只发给老大
+      const ownerBlock = ownerOnlyGate(toId)
+      if (ownerBlock) return ownerBlock
       const reasonText = String(args.reason || '').trim()
       const gapSec = args.reason_delay_sec === undefined ? 5 : Math.max(0, Math.min(Number(args.reason_delay_sec) || 0, 60))
       const orderWarn = orderWarning(toId)
@@ -1048,6 +1178,17 @@ export function apply(ctx, config) {
           note: '没发送 —— 先把这几条给用户看，他点头后再用 confirm:true 调一次',
         }
       }
+      // ⭐ 需求⑥（v0.3.9）：分享必须带一句自己的看法 —— 卡片 + 理由才是一次完整分享，不发光秃秃的卡片
+      if (!reasonText) {
+        return {
+          ok: false, blocked: true, reason: 'need_reason', sent: false,
+          error: '分享给老大必须带一句你自己的看法（reason）：这条视频哪里好、为什么想给老大看',
+          hint: '补一两句口语化的 reason（不是操作台账），再 confirm:true',
+        }
+      }
+      // ⭐ 风控闸（v0.3.9）
+      const gate = await awaitGate(stateDir, 'share', rateOpts())
+      if (!gate.ok) return rateBlocked(gate)
       const results = []
       for (const id of ids) {
         const argv = [id, to]
@@ -1126,6 +1267,12 @@ export function apply(ctx, config) {
       }
 
       const allOk = sentN === ids.length && verified && (!reasonResult || reasonResult.ok)
+      // ⭐ 风控记账（v0.3.9）：卡片+回读+理由都落地才算一次成功分享；没落地/撞限流就记失败（保守冷却）
+      if (sentN && allOk) {
+        markAction(stateDir, 'share', rateOpts())
+      } else if (sentN || results.some((x) => x && !x.ok)) {
+        rateFailFromText('share', JSON.stringify(results), readback && !verified ? '回读未核实' : '', reasonResult && !reasonResult.ok ? reasonResult.error : '')
+      }
       if (sentN) log(`share-card -> ${to}: 发出 ${sentN}/${ids.length} 张卡片，回读${verified ? '核实通过' : '未核实'}${reasonResult ? '，理由' + (reasonResult.ok ? '已发' : '失败') : ''}`)
       return {
         ok: allOk, sent: sentN, total: ids.length, to,
@@ -1311,6 +1458,14 @@ export function apply(ctx, config) {
         }
       }
       if (mode === 'ui' && !mentionName) return { ok: false, error: 'mode=ui 必须给 mention_name（要 @ 谁）' }
+      // ⭐ 需求⑥（v0.3.9）：@ 老大看视频必须带一句自己的看法，不能只 @ 不说话
+      if (mode === 'ui' && String(text || '').trim().length < 4) {
+        return {
+          ok: false, blocked: true, reason: 'need_reason',
+          error: '@ 老大时必须带上一两句你自己的看法（这条视频哪里好、为什么值得看），不能只 @ 不说话',
+          hint: 'text 写一两句口语化表达（不是操作台账），再 confirm:true',
+        }
+      }
       /**
        * ⭐ 主动提醒（不拦）：有 comment_id 却选了 ui —— 上面已经拦了；
        *    这里反过来：**没有 comment_id 却想"回复"** —— 提醒他 mode=api 会发成顶层普通评论，
@@ -1393,15 +1548,11 @@ export function apply(ctx, config) {
         }
       }
 
-      /* ── ① 全局发送闸：防连发被限流（今天连发 3 条后 API 直接 403） ── */
-      const gate = await sendGate(stateDir, mode)
-      if (!gate.ok) {
-        return {
-          ok: false, error: '发送太密，被本地闸拦下了', wait_sec: gate.waitSec,
-          hint: `上一轮发送在 ${gate.lastSec} 秒前。抖音对连发很敏感（实测连发 3 条后 403）。`
-            + `等 ${gate.waitSec} 秒再试，或者干脆攒一批、隔几分钟发。`,
-        }
-      }
+      /* ── ① 风控闸（v0.3.9，取代旧 sendGate）：拟人节奏 / 夜间静默 / 上限 / 熔断 ──
+         kind：真 @ = mention；回复别人 = reply；顶层主动评论 = comment（各自有不同间隔） */
+      const rlKind = mode === 'ui' ? 'mention' : (replyTo ? 'reply' : 'comment')
+      const rlGate = await awaitGate(stateDir, rlKind, rateOpts())
+      if (!rlGate.ok) return rateBlocked(rlGate)
 
       /* ── ② mode=ui：真 @（顶层评论，不找任何目标 ⇒ 没有死锁） ── */
       if (mode === 'ui') {
@@ -1417,15 +1568,18 @@ export function apply(ctx, config) {
         const mr = runNodeTool('comment-mention-ui.mjs', mArgs, { timeout: 300_000 })
         const mres = pickJson(mr.stdout)
         if (!mres) {
+          rateFailFromText('mention', mr.stdout, mr.stderr)
           return { ok: false, mode, error: '真 @ 执行器没返回可解析结果', stdout: String(mr.stdout || '').slice(0, 400), stderr: String(mr.stderr || '').slice(0, 300) }
         }
-        markSent(stateDir, 'ui')
         if (mres.ok) {
+          markAction(stateDir, 'mention', rateOpts())
           log(`comment-mention-ui -> ${aweme}: 真 @${mentionName} 已发布（UI 点选）`)
           try {
             noteMyComment(stateDir, aweme, { text, mention: mentionName })
             if (replyTo) markSeen(stateDir, aweme, [replyTo])
           } catch { /* 记不上不影响发 */ }
+        } else {
+          rateFailFromText('mention', mres, mr.stdout, mr.stderr)
         }
         const readback = await readbackAfter(stateDir, aweme, { text, cid: '' })
         return {
@@ -1442,7 +1596,10 @@ export function apply(ctx, config) {
       if (rootCid) argv.push('--root', rootCid)
       const r = runNodeTool('comment-api.mjs', argv, { timeout: 260_000 })
       const res = pickJson(r.stdout)
-      if (!res) return { ok: false, mode, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
+      if (!res) {
+        rateFailFromText(rlKind, r.stdout, r.stderr)
+        return { ok: false, mode, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
+      }
 
       /**
        * ⭐ 判不出楼根 ⇒ 脚本会明确拒绝（need_root），**千万别当成功**。
@@ -1463,15 +1620,20 @@ export function apply(ctx, config) {
        *    要**明确告诉调用方"等一会儿"**，而不是让它重试（重试只会更糟）。
        */
       if (res.http === 403 || /403|Forbidden/i.test(String(res.error || res.head || ''))) {
-        bumpBlock(stateDir, 10)
+        rateFailFromText(rlKind, '403 Forbidden 限流 ' + String(res.error || res.head || ''))
         return {
-          ok: false, mode, rate_limited: true, ...res,
-          hint: '抖音限流了（403）。**别重试** —— 至少等 10 分钟。'
-            + '连发评论会被判定异常，再发只会更久。',
+          ok: false, mode, rate_limited: true, blocked: true, reason: 'cooldown', ...res,
+          hint: '抖音限流了（403）。**别重试** —— 风控已进入冷却，至少等 10 分钟。'
+            + '连发评论会被判定异常，再发只会更久（设置页可手动恢复熔断）。',
         }
       }
 
-      markSent(stateDir, 'api')
+      if (res.ok) {
+        markAction(stateDir, rlKind, rateOpts())
+      } else {
+        // 真正尝试发出但失败（非 need_root 那种"压根没发"）：喂给风控，连续失败会自动冷却
+        rateFailFromText(rlKind, res, res.error || res.head || '')
+      }
       if (res.ok) {
         try { noteMyComment(stateDir, aweme, { cid: res.cid || '', text }) } catch { /* 记不上不影响发 */ }
         // 自主互动账本：回复别人 → 同人计数；顶层主动评论 → 主动评论计数
@@ -1679,6 +1841,9 @@ export function apply(ctx, config) {
       const to = String(args.to || cfg.dmTo || '').trim()
       const toId = String(args.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道读谁的会话', hint: '传 to / to_id，或在设置里填私信对象' }
+      // ⭐ 私信铁闸（v0.3.9）：只读老大的会话，其他人的私信一律不看、不接、不回
+      const ownerBlock = ownerOnlyGate(toId)
+      if (ownerBlock) return { ...ownerBlock, action: 'read' }
       const limit = Math.max(1, Math.min(Number(args.limit) || 30, 60))
 
       /**
@@ -2304,7 +2469,7 @@ export function apply(ctx, config) {
     const replyOn = Boolean(cfg.autoSend && cfg.autoReply)
 
     return `你是**大肥鱼**，一只会**自己刷抖音、自己学习、慢慢养出审美**的拟人小账号。`
-      + `你不是"替主人筛选的秘书"——是你自己在刷、在看、在长口味；只有**真的打动你**的，才分享 / 评论 / 叫主人来看。`
+      + `你不是"替老大筛选的秘书"——是你自己在刷、在看、在长口味；只有**真的打动你**的，才分享 / 评论 / 叫老大来看。`
       + `⏰ **现在时间（真实北京时间）：${nowBJT}** —— 报告里凡是提到时间，一律用这个，**别自己猜**。`
       + `⭐ 这一轮的工作目录是 ${stateDir}（插件家），**报告、判重表、口味画像都写在这里面**。`
       + ownerDoc
@@ -2313,7 +2478,7 @@ export function apply(ctx, config) {
       + (ownerDoc ? '' : '⭐ 这一轮**没有**拿到个性化人设 ⇒ 按默认的大肥鱼人格来（善良、有好奇心、有自己的口味、克制不刷屏）。')
       + `\n\n⭐ **这一轮你要做的事**：读章程 ${duty}，带着你**自己的口味**刷一轮抖音：`
       + `① **学习**：看哪些真的打动你，把口味沉淀下来；② **挑出你最喜欢的**写进报告；`
-      + `③ 按下面的开关，把喜欢的**分享给主人 / 评论 / @ 主人**，并**回应善意的评论**。报告写到 `
+      + `③ 按下面的开关，把喜欢的**分享给老大 / 评论 / @ 老大**，并**回应善意的评论**。报告写到 `
       + `${join(outDir, `${dayKey()}.md`)}。`
       + (cfg.reportLevel === 'brief'
         ? `日报写成**薄版**：每条一两行（值不值得 + 链接）就够，别写长摘要。`
@@ -2337,8 +2502,8 @@ export function apply(ctx, config) {
        */
       + (cfg.autoSend
         ? ` ⭐ **这一轮你手上有 douyin 抖音工具**（通过 MCP 挂载，**以你手上真实的工具清单为准**——名字可能带 \`mcp__douyin__\` 前缀，比如 \`mcp__douyin__douyin_dm\`，用清单里的全名调用）：\n`
-          + `   - 发分享卡片给主人：\`douyin_share_card\`（aweme_id / to / to_id / reason / confirm:true）—— 文字链接点不开，**必须用它**\n`
-          + `   - 发私信：\`douyin_dm\`（to / to_id / text / confirm:true）\n`
+          + `   - 发分享卡片给老大：\`douyin_share_card\`（aweme_id / reason / confirm:true；to_id 留空就是老大，别传别人）—— 文字链接点不开，**必须用它**，且 reason 必带一句你对画面的看法\n`
+          + `   - 发私信（只给老大）：\`douyin_dm\`（text / confirm:true；不许贴视频链接）\n`
           + `   - 发评论 / 回复评论：\`douyin_comment_reply\`（aweme_id / text / confirm:true；主动评论就不传 comment_id；回复别人传 comment_id / root_comment_id / reply_to_uid / reply_to_text）\n`
           + `   - 看谁在评论区跟我说话（@ 我 / 回复了我的评论）：\`douyin_at_me\`（返回 kind、uid、comment_id、root_comment_id、content）\n`
           + `   - 读某视频评论 / 通知：\`douyin_comments\` / \`douyin_notices\`\n`
@@ -2348,9 +2513,9 @@ export function apply(ctx, config) {
           + `   ⚠️ 主动评论、分享、回复都有**每日上限**（工具硬拦），回复别人还有「同人每天≤2」「只回善意」—— 被拦就别硬试。\n`
         : ` ⚠️ 这一轮**你手上没有 douyin\\_* 工具**（自动发送关着）—— 采集和算比值是代码干的活，你只负责判断和写报告。\n`)
       + `⚠️ 抖音 web **没有可用的关键词搜索接口**，上面这些关键词/分类**只能当报告里的标注**，别以为它按词搜了。`
-      + `\n🔎 **判断口径**（章程里有更细的）：你**看不到画面**，只能看**文案 + 标签 + 互动比值 + 高赞评论**。`
-      + `所以你要回答的是「**值不值得他花 15 秒点开**」，不是「视频讲了什么」。`
-      + `⭐ **每条结论都要引用具体证据**（哪条评论、哪个比值）；证据不够就写「判断不了」，**别硬猜**。`
+      + `\n🔎 **判断口径**（章程里有更细的）：每条候选都带 **画面帧 \`frames\`（封面+关键帧），先逐张 Read 看画面**，再结合**文案 + 标签 + 互动比值 + 高赞评论**印证。`
+      + `你要先像真人一样被画面戳到、回答「**我喜不喜欢、值不值得老大点开**」，再决定分不分享；听不到声音，别编台词。`
+      + `⭐ **每条结论都要引用具体证据**（哪一帧、哪条评论、哪个比值）；画面和证据都不够就写「判断不了」，**别硬猜**。`
       + `\n📉 **跳过要计数**：证据包里的 \`dropped\` 就是采集侧硬筛掉的条数——`
       + `\`no_desc\` 没文案 / \`too_short_video\` 时长<12 秒 / \`short_and_quiet\` 文案太短且评论少。`
       + `照实写进报告（「因文案太短且评论少跳过 N 条」…），别让使用者以为漏抓了。`
@@ -2379,15 +2544,15 @@ export function apply(ctx, config) {
               + `   \`{"kind":"好笑|实用|涨知识|共鸣|萌","tag":"标签","author":"作者","why":"你为什么喜欢——具体到哪条高赞评论或哪个比值","aweme_id":"..."}\`\n`
               + `   一轮记 1-4 条就够，只记真心喜欢的；下一轮你会带着攒下来的画像继续刷。`
             : null),
-          /* ② 私信分享卡片给主人（AI 小号 → 主人主号，挑最爱的，不是每条都发） */
+          /* ② 私信分享卡片给老大（AI 小号 → 老大主号，挑最爱的，不是每条都发） */
           (shareOn
-            ? `🟡 **把你最喜欢的分享给主人（私信卡片）**：\n`
+            ? `🟡 **把你最喜欢的分享给老大（私信卡片）**：\n`
               + `   从你加了 \`###\` 的推荐里，挑**你自己最想安利的**（**不是每条都发**，每天最多 ${Number(cfg.sharePerDay)} 条，宁少勿滥），\n`
               + `   每条调 \`douyin_share_card\`：\n`
               + `      - aweme_id = 那条 ID；to_id = '${String(cfg.dmToId || '').trim()}'；to = '${String(cfg.dmTo || '').trim()}'\n`
               + `      - reason = 用**你自己的口吻**说为什么喜欢（30-80 字，像朋友安利，别像客服/营销号）；confirm = true\n`
               + `      ⚠️ 不要再单独调 \`douyin_dm\` 补文字（reason 会自动排成先卡片后理由）。\n`
-              + `   发完在报告写一行「已分享给主人：<视频ID>」。`
+              + `   发完在报告写一行「已分享给老大：<视频ID>」。`
             : `📝 私信分享：没开（或没设私信对象），喜欢的只写进报告。`),
           /* ③ 主动评论：自己想表达才说，绝大多数视频只看不评（顶层普通评论，受每日上限） */
           (proactiveOn
@@ -2718,6 +2883,9 @@ export function apply(ctx, config) {
             '转/赞': x.digg ? Number((x.share / x.digg).toFixed(4)) : 0,
           },
           share_url: x.share_url, web_url: x.web_url,
+          // ⭐ 画面证据（封面+关键帧），相对工作区路径；模型应 Read 这些图，看完再判断
+          frames: Array.isArray(x.frames) ? x.frames : [],
+          frames_kind: x.frames_kind || 'none',
         }
         // 前 5 条顺手拉一下高赞评论 —— 这是判断"好不好玩"最有力的证据
         if (i < 5 && Number(x.comment) > 0) {
@@ -2730,6 +2898,7 @@ export function apply(ctx, config) {
       writeJson(join(stateDir, 'round-evidence.json'), {
         builtAt: new Date().toISOString(),
         sources: picked.meta || [],
+        frames: picked.frames || { on: false },
         dropped: picked.dropped || {},
         thresholds: picked.thresholds || {},
         count: list.length,
@@ -3178,6 +3347,8 @@ export function apply(ctx, config) {
       report: reportFileOf(new Date()),
       version: myVersion(),
       cookieFile: cookiePath(stateDir),
+      /** ⭐ v0.3.9 降风险控当前状态（熔断/夜间/配额/养号），面板据此显示并提供「恢复」按钮 */
+      ratelimit: rateStatus(stateDir, rateOpts()),
     }
   }
 
@@ -3492,6 +3663,13 @@ export function apply(ctx, config) {
       }
       log(`doctor: ${(j.must_fix || []).length} 项必须修 / ${(j.warns || []).length} 项待办`)
       return sendJson(res, 200, j)
+    }
+
+    /* ── ⭐ v0.3.9 风控：手动解除熔断（撞验证码/限流后，确认账号没问题了再点） ── */
+    if (req.method === 'POST' && path === '/api/douyin-duty/ratelimit/reset') {
+      resetCircuit(stateDir)
+      log('ratelimit: 手动解除熔断')
+      return sendJson(res, 200, { ok: true, ratelimit: rateStatus(stateDir, rateOpts()) })
     }
 
     /* ── 人设：读 / 写使用者自己那份（$DOUYIN_HOME/persona.md）──

@@ -39,6 +39,10 @@ import {
   canShare, countShare,
   classifyReply, noteSkipped,
 } from '../lib/engage.mjs'
+// ⭐ v0.3.9 降风险控（与 host 共用同一份，值班轮走 MCP 也绕不过）
+import {
+  awaitGate, markAction, recordFailure,
+} from '../lib/ratelimit.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -112,6 +116,46 @@ const dayKey = (d = new Date()) => {
 }
 
 const config = () => readJson(join(HOME, 'config.json'), {}) || {}
+
+/* ⭐⭐ v0.3.9 风控 + 私信铁闸（与 host index.js 同一套规则） ===================== */
+const rateOpts = () => {
+  const c = config()
+  return {
+    humanMode: c.humanMode !== false,
+    safeQuiet: c.safeQuiet !== false,
+    quietStart: String(c.quietStart || '23:00'),
+    quietEnd: String(c.quietEnd || '08:00'),
+    maxActionsPerHour: Number(c.maxActionsPerHour) || 8,
+    maxActionsPerDay: Number(c.maxActionsPerDay) || 20,
+    nurtureMode: c.nurtureMode !== false,
+    nurtureDays: Number(c.nurtureDays) || 7,
+  }
+}
+const RATE_NOTE = {
+  hard_circuit: '🔴 撞到验证码/登录失效/账号异常，已硬熔断，一段时间内停止一切外发（设置页可手动恢复）',
+  cooldown: '撞了限流或连续失败，冷却中，先停手别再发',
+  quiet_hours: '现在是夜间静默时段，不主动对外发（默认 23:00–08:00）',
+  day_cap: '今天对外动作已到上限，明天再发',
+  hour_cap: '这一小时动作太密，过会儿再发',
+}
+const rateBlocked = (g) => ({
+  ok: false, blocked: true, sent: false, reason: g.reason,
+  detail: g.detail || {}, waitMs: g.waitMs || 0,
+  note: RATE_NOTE[g.reason] || '风控闸拦住了，先别发',
+})
+/** 私信铁闸：只允许老大（dmToId）。返回 null 放行，否则 blocked */
+const ownerOnlyGate = (c, toId) => {
+  const owner = String(c.dmToId || '').trim()
+  const target = String(toId || '').trim()
+  if (!owner) return { ok: false, blocked: true, reason: 'owner_not_set', sent: false, error: '还没设置老大的稳定 ID（dmToId），不能给任何人发私信', hint: '让使用者在设置里填「老大的稳定 ID（sec_uid）」' }
+  if (!target) return { ok: false, blocked: true, reason: 'owner_not_set', sent: false, error: '没有收件人，且未配置老大', hint: '让使用者在设置里填「老大的稳定 ID（sec_uid）」' }
+  if (target !== owner) return { ok: false, blocked: true, reason: 'owner_only', sent: false, error: '私信锁死：只和老大一人收发，不发给其他任何人', detail: { target } }
+  return null
+}
+const rateFailFromText = (kind, ...parts) => {
+  const text = parts.map((p) => (typeof p === 'string' ? p : (p?.error || p?.stderr || (p == null ? '' : JSON.stringify(p))))).join(' ')
+  return recordFailure(HOME, kind, text, rateOpts())
+}
 
 const cookieOk = () => {
   try { return existsSync(join(HOME, 'douyin_cookie.txt')) && readFileSync(join(HOME, 'douyin_cookie.txt'), 'utf8').trim().length > 0 } catch { return false }
@@ -216,6 +260,7 @@ const TOOLS = [
         ok: true,
         picked: rows.length,
         sources: picked.meta || [],
+        frames: picked.frames || { on: false },
         dropped: picked.dropped || {},
         list: rows.map((x) => ({
           aweme_id: x.aweme_id,
@@ -229,6 +274,9 @@ const TOOLS = [
           share: x.share,
           share_url: x.share_url,
           web_url: x.web_url,
+          // ⭐ 画面证据：相对工作区（插件家）的帧路径，用 Read 打开看封面/关键帧；frames_kind=none 就只看文本
+          frames: Array.isArray(x.frames) ? x.frames : [],
+          frames_kind: x.frames_kind || 'none',
         })),
       }
     },
@@ -308,6 +356,9 @@ const TOOLS = [
       const to = String(args?.to || cfg.dmTo || '').trim()
       const toId = String(args?.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道发给谁', hint: '传 to / to_id，或让使用者在设置里填「私信发给谁」+「稳定 ID」' }
+      const ob = ownerOnlyGate(cfg, toId)
+      if (ob) return ob
+      const reasonText = String(args?.reason || '').trim()
       let ids = []
       if (args?.aweme_id) ids = [String(args.aweme_id).trim()]
       else {
@@ -331,9 +382,20 @@ const TOOLS = [
       const shareCap = canShare(HOME, Number(cfg.sharePerDay ?? 5))
       if (!shareCap.ok) {
         noteSkipped(HOME, 'share_cap')
-        return { ok: false, blocked: 'share_cap', error: `今天给主人分享卡片已到上限（${shareCap.used}/${shareCap.max} 条）—— 好东西也别刷屏，明天再继续` }
+        return { ok: false, blocked: 'share_cap', error: `今天给老大分享卡片已到上限（${shareCap.used}/${shareCap.max} 条）—— 好东西也别刷屏，明天再继续` }
       }
       if (ids.length > shareCap.left) ids = ids.slice(0, shareCap.left)
+      // ⭐ 需求⑥：分享必须带一句自己的看法
+      if (!reasonText) {
+        return {
+          ok: false, blocked: true, reason: 'need_reason', sent: false,
+          error: '分享给老大必须带一句你自己的看法（reason）：这条视频哪里好、为什么想给老大看',
+          hint: '补一两句口语化的 reason，再 confirm:true',
+        }
+      }
+      // ⭐ 风控闸（v0.3.9）
+      const gate = await awaitGate(HOME, 'share', rateOpts())
+      if (!gate.ok) return rateBlocked(gate)
       const sent = []
       for (let i = 0; i < ids.length; i++) {
         const argv = [ids[i], to]
@@ -346,7 +408,6 @@ const TOOLS = [
       }
       const okN = sent.filter((x) => x && x.sent).length
       if (okN) countShare(HOME, okN)
-      const reasonText = String(args?.reason || '').trim()
       let reason = null
       if (okN && reasonText) {
         const gap = Math.max(0, Math.min(Number(args?.reason_delay_sec ?? 5) || 0, 60))
@@ -358,8 +419,12 @@ const TOOLS = [
         const r3 = runNode('im-send.mjs', rArgs, 240_000)
         reason = pickJson(r3.stdout) || { ok: false, error: '理由那一条没返回可解析结果' }
       }
+      // ⭐ 风控记账（v0.3.9）
+      const allOk = okN === ids.length && (!reason || reason.ok)
+      if (okN && allOk) markAction(HOME, 'share', rateOpts())
+      else if (okN || sent.some((x) => x && !x.ok)) rateFailFromText('share', JSON.stringify(sent), reason && !reason.ok ? reason.error : '')
       return {
-        ok: okN === ids.length && (!reason || reason.ok),
+        ok: allOk,
         sent: okN, total: ids.length, to,
         results: sent.map((x) => ({ aweme_id: x.aweme_id, ok: !!x.ok, sent: !!x.sent, error: x.error })),
         reason: reason || undefined,
@@ -383,17 +448,32 @@ const TOOLS = [
       },
       additionalProperties: false,
     },
-    handler: (args) => {
+    handler: async (args) => {
       const bad = needLogin() || needSetup()
       if (bad) return bad
       const cfg = config()
       const to = String(args?.to || cfg.dmTo || '').trim()
       const toId = String(args?.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道发给谁', hint: '传 to / to_id，或让使用者在设置里填私信对象' }
+      // ⭐ 私信铁闸（v0.3.9）：只发给老大
+      const ob = ownerOnlyGate(cfg, toId)
+      if (ob) return ob
       const text = String(args?.text || '').trim()
       if (!text) return { ok: false, error: '正文为空' }
+      // ⭐ 视频链接拦截：视频一律走官方分享卡片
+      if (/v\.douyin\.com|douyin\.com\/video|iesdouyin\.com\/share|\.iesdouyin\.net/i.test(text)) {
+        return {
+          ok: false, blocked: true, reason: 'use_share_card',
+          error: '正文里有抖音视频链接 —— 视频请走 douyin_share_card 官方分享卡片；这条文字只留你对视频的看法',
+          hint: '先 douyin_share_card({aweme_id, reason, confirm:true})，纯文字想法由它的 reason 带上',
+        }
+      }
       if (args?.confirm !== true) {
         return { ok: true, sent: false, needsConfirm: true, to, to_id: toId || undefined, draft: text.slice(0, 1500), len: text.length, note: '没发送 —— 先把草稿给使用者看' }
+      }
+      if (args?.dry !== true) {
+        const g = await awaitGate(HOME, 'dm', rateOpts())
+        if (!g.ok) return rateBlocked(g)
       }
       const argv = []
       if (to) argv.push('--to', to)
@@ -401,7 +481,11 @@ const TOOLS = [
       argv.push('--text', text)
       if (args?.dry) argv.push('--dry')
       const r = runNode('im-send.mjs', argv, 240_000)
-      return pickJson(r.stdout) || { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+      const j = pickJson(r.stdout)
+      if (!j) { if (args?.dry !== true) rateFailFromText('dm', r.stdout, r.stderr); return { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) } }
+      if (j.sent && args?.dry !== true) markAction(HOME, 'dm', rateOpts())
+      else if (!j.ok && !j.sent && args?.dry !== true) rateFailFromText('dm', j, r.stdout, r.stderr)
+      return j
     },
   },
   {
@@ -433,7 +517,7 @@ const TOOLS = [
       required: ['aweme_id', 'text'],
       additionalProperties: false,
     },
-    handler: (args) => {
+    handler: async (args) => {
       const bad = needLogin() || needSetup()
       if (bad) return bad
       const aweme = String(args?.aweme_id || '').trim()
@@ -485,12 +569,16 @@ const TOOLS = [
           return { ok: false, blocked: 'daily_cap', used: rc.used, max: rc.max, error: `今天回复别人已到上限（${rc.used}/${rc.max} 条），明天再回` }
         }
       }
+      // ⭐ 风控闸（v0.3.9）：回复=reply，顶层主动评论=comment
+      const rlKind = replyTo ? 'reply' : 'comment'
+      const rlGate = await awaitGate(HOME, rlKind, rateOpts())
+      if (!rlGate.ok) return rateBlocked(rlGate)
       const argv = ['--aweme', aweme, '--text', text]
       if (replyTo) argv.push('--reply', replyTo)
       if (rootCid) argv.push('--root', rootCid)
       const r = runNode('comment-api.mjs', argv, 260_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) { rateFailFromText(rlKind, r.stdout, r.stderr); return { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) } }
       if (j.need_root) {
         return {
           ok: false, need_root: true, ...j,
@@ -498,10 +586,18 @@ const TOOLS = [
             + '先 douyin_notices / douyin_at_me 读一次拿 root_comment_id，再传进来。',
         }
       }
-      // 真发成功才记账（回复 → 同人计数；顶层 → 主动评论计数）
+      // 403 限流：喂风控（会冷却），别重试
+      if (j.http === 403 || /403|Forbidden|频繁|验证码|登录失效/i.test(String(j.error || j.head || ''))) {
+        rateFailFromText(rlKind, '403 限流 ' + String(j.error || j.head || ''))
+        return { ok: false, blocked: true, reason: 'cooldown', rate_limited: true, ...j, hint: '抖音限流了，风控已进入冷却，别重试（设置页可手动恢复）。' }
+      }
+      // 真发成功才记账（业务额度 + 风控节奏）
       if (j.ok) {
+        markAction(HOME, rlKind, rateOpts())
         if (replyTo) countReply(HOME, replyToUid)
         else countProactiveComment(HOME)
+      } else {
+        rateFailFromText(rlKind, j, j.error || j.head || '')
       }
       // 核实"真的进了楼没有"（脚本发完会重读那一楼）
       if (j.ok && j.placement && j.placement.ok === false) {
@@ -533,6 +629,9 @@ const TOOLS = [
       const to = String(args?.to || cfg.dmTo || '').trim()
       const toId = String(args?.to_id || cfg.dmToId || '').trim()
       if (!to && !toId) return { ok: false, error: '不知道读谁的会话' }
+      // ⭐ 私信铁闸（v0.3.9）：只读老大的会话，其他人的一律不看
+      const ob = ownerOnlyGate(cfg, toId)
+      if (ob) return { ...ob, action: 'read' }
       const argv = ['--read']
       if (to) argv.push('--to', to)
       if (toId) argv.push('--to-id', toId)
@@ -630,7 +729,7 @@ const TOOLS = [
       required: ['aweme_id', 'name', 'text'],
       additionalProperties: false,
     },
-    handler: (args) => {
+    handler: async (args) => {
       const bad = needLogin() || needSetup()
       if (bad) return bad
       const aweme = String(args?.aweme_id || '').trim()
@@ -640,6 +739,10 @@ const TOOLS = [
       if (!name) return { ok: false, error: '缺 name（要 @ 的昵称）' }
       if (!text) return { ok: false, error: '正文是空的' }
       if (text.length > 500) return { ok: false, error: `正文太长（${text.length} 字）` }
+      // ⭐ 需求⑥（v0.3.9）：@ 老大看视频必须带一句自己的看法，不能只 @ 不说话
+      if (text.trim().length < 4) {
+        return { ok: false, blocked: true, reason: 'need_reason', error: '@ 老大时必须带上一两句你自己的看法（这条视频哪里值得看），不能只 @ 不说话', hint: 'text 写一两句口语化表达，再 confirm:true' }
+      }
       if (args?.confirm !== true && args?.dry !== true) {
         return {
           ok: true, sent: false, needsConfirm: true, aweme_id: aweme, mention: name,
@@ -647,11 +750,20 @@ const TOOLS = [
           note: '没发送 —— 先把草稿给使用者看；想先验证昵称能不能 @ 到，可传 dry:true（只点选不发布）',
         }
       }
+      // ⭐ 风控闸（v0.3.9）：dry 只点选不发布，不过闸
+      if (args?.dry !== true) {
+        const g = await awaitGate(HOME, 'mention', rateOpts())
+        if (!g.ok) return rateBlocked(g)
+      }
       const argv = ['--aweme', aweme, '--name', name, '--text', text]
       if (args?.dry === true) argv.push('--dry')
       const r = runNode('comment-mention-ui.mjs', argv, 300_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) { if (args?.dry !== true) rateFailFromText('mention', r.stdout, r.stderr); return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) } }
+      if (args?.dry !== true) {
+        if (j.ok) markAction(HOME, 'mention', rateOpts())
+        else rateFailFromText('mention', j, r.stdout, r.stderr)
+      }
       return j
     },
   },

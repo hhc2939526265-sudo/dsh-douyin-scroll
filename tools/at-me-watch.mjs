@@ -29,10 +29,10 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 
 /**
- * 特殊称呼（默认「主人」）。**只有号主能用** —— 别处一律禁。
+ * 特殊称呼（默认「老大」）。**只有号主能用** —— 别处一律禁。
  * 想换称呼就设环境变量 DOUYIN_HONORIFIC，或改这一行。
  */
-const HONORIFIC = String(process.env.DOUYIN_HONORIFIC || '主人').trim() || '主人'
+const HONORIFIC = String(process.env.DOUYIN_HONORIFIC || '老大').trim() || '老大'
 /** 回复模板：{HO} 会被换成上面的称呼 */
 const GREETING_TEMPLATE = process.env.DOUYIN_REPLY_GREETING || '{HO}我在呢～ 这楼我盯着，谁说话我都接一句'
 /** 几条按情景选的兜底回复（都可被环境变量覆盖） */
