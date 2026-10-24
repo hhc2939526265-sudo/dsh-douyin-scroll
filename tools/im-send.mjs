@@ -25,6 +25,7 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { openPage, sleep } from '../lib/chrome.mjs'
+import { uploadImageByUrl, waitForPreview } from '../lib/img-upload.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -36,6 +37,8 @@ const TO = argOf('--to', '')
 const TOID = argOf('--to-id', '')
 const FILE = argOf('--file', '')
 const TEXT = argOf('--text', '')
+/** ⭐ v0.4.1 私信发图片表情：给一张图片 URL（无文字，走聊天框图片上传） */
+const IMAGE = argOf('--image', '')
 const DRY = argv.includes('--dry')
 const READ = argv.includes('--read')
 /** ⭐ --list：只列出会话里的人（昵称 + sec_uid），不发东西 */
@@ -591,8 +594,8 @@ async function main() {
 
   const text = FILE ? readFileSync(FILE, 'utf8').trim() : String(TEXT || '').trim()
   if (!READ) {
-    if (!text) return out({ ok: false, error: '没有正文（用 --text 或 --file）' })
-    if (text.length > 1800) return out({ ok: false, error: `正文太长（${text.length} 字），抖音信信放不下，拆开发` })
+    if (!text && !IMAGE) return out({ ok: false, error: '没有正文（用 --text / --file），或用 --image 发图片表情' })
+    if (text && text.length > 1800) return out({ ok: false, error: `正文太长（${text.length} 字），抖音信信放不下，拆开发` })
   }
 
   const c = await openPage({ url: 'https://www.douyin.com/chat' })
@@ -679,6 +682,98 @@ async function main() {
         ok: false, sent: false, error: '发送前核对失败：右栏是「' + gateNick + '」，不是「' + target.nick + '」，已中止（没发出去）',
         want: target.nick, got: gateNick, chrome: chromed,
       })
+    }
+
+    // ── 图片表情（--image）：走聊天框图片上传（只发给老大，白名单在 host 工具层）──
+    if (IMAGE) {
+      let upCleanup = null
+      // 回读：我发的图片消息条数（头像在右=me 且行内有较大图片，排除头像/分享卡）
+      const countMyImg = async () => Number(await c.ev(`(function(){
+        var listNode = document.querySelector('[class*="messageMessageList"]') || document.querySelector('[class*="componentsRightPanel"]') || document.body;
+        var lb = listNode.getBoundingClientRect();
+        var nodes = Array.prototype.slice.call(listNode.querySelectorAll('[class*="messageMessageBox"]'));
+        var n = 0, seen = new WeakSet();
+        nodes.forEach(function(nd){
+          var rr = nd.getBoundingClientRect();
+          var im = Array.prototype.slice.call(nd.querySelectorAll('img')).filter(function(img){
+            var b=img.getBoundingClientRect();
+            if (b.width<28||b.width>48||Math.abs(b.width-b.height)>6) return false;
+            var cy=img.getBoundingClientRect().top+b.height/2;
+            return cy>=rr.top-2&&cy<=rr.bottom+2;
+          })[0];
+          if (!im) return;
+          var ib=im.getBoundingClientRect();
+          var isMe = (ib.left+ib.width/2) > lb.left+lb.width/2;
+          if (!isMe) return;
+          var fk = Object.keys(nd).find(function(k){return k.indexOf('__reactFiber$')===0});
+          var obj=null;
+          if (fk){ var f=nd[fk],d=0; while(f&&d<20){ var p=f.memoizedProps; if(p&&p.message){obj=p.message;break;} f=f.return;d++; } }
+          if (!obj || seen.has(obj)) return;
+          var big = Array.prototype.slice.call(nd.querySelectorAll('img')).some(function(img){
+            var b=img.getBoundingClientRect();
+            if (b.width<60||b.height>500) return false;
+            if (b.width>=100&&b.width<=116) return false;
+            return true;
+          });
+          if (big){ seen.add(obj); n++; }
+        });
+        return n;
+      })()`))
+      try {
+        const up = await uploadImageByUrl(c, IMAGE, 'dm')
+        upCleanup = up.cleanup || null
+        if (up.unavailable === 'image_uploader') {
+          return out({ ok:false, sent:false, unavailable: 'image_uploader', to:target.nick,
+            error:'聊天框没找到图片上传入口（该号/页面没有私信图片能力）；平台贴纸表情不受影响。', chrome:chromed })
+        }
+        if (!up.ok) return out({ ok:false, sent:false, error:up.error||'图片没塞进聊天框', chrome:chromed })
+        const dmPreview = `(function(){
+          var r = document.querySelector('[class*="componentsRightPanel"]') || document.body;
+          var imgs = Array.prototype.slice.call(r.querySelectorAll('img')).filter(function(im){
+            var b=im.getBoundingClientRect();
+            if (b.width<60||b.height<60) return false;
+            var src=(im.src||'')+(im.currentSrc||'');
+            return /blob:|douyinpic|tos-|image|aweme|webcast/i.test(src);
+          });
+          if (imgs.length) return true;
+          return Array.prototype.slice.call(r.querySelectorAll('div,button,span')).some(function(el){
+            return (el.innerText||'').replace(/\\s+/g,'')==='发送' && el.getBoundingClientRect().width>30;
+          });
+        })()`
+        const preview = await waitForPreview(c, dmPreview, {timeoutMs:12000})
+        if (DRY) return out({ ok:true, sent:false, dry:true, to:target.nick, has_uploader:true, preview,
+          mime:up.mime, bytes:up.bytes, note:'dry：只验证图片入口与预览，未发送。', chrome:chromed })
+        if (!preview) return out({ ok:false, sent:false, error:'图片塞进去了但没出现待发预览，没发送。', chrome:chromed })
+        const beforeImg = await countMyImg()
+        // 点预览弹层"发送"按钮；找不到则回车
+        const btnInfo = JSON.parse(await c.ev(`(function(){
+          var r = document.querySelector('[class*="componentsRightPanel"]') || document.body;
+          var cands = Array.prototype.slice.call(r.querySelectorAll('div,button,span')).filter(function(el){
+            return (el.innerText||'').replace(/\\s+/g,'')==='发送' && el.getBoundingClientRect().width>30;
+          });
+          for (var i=0;i<cands.length;i++){ var b=cands[i].getBoundingClientRect(); if(b.left>=0&&b.top>=0) return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)}); }
+          return 'null';
+        })()`))
+        if (btnInfo) {
+          await c.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:btnInfo.x,y:btnInfo.y,button:'none',buttons:0}); await sleep(120)
+          await c.send('Input.dispatchMouseEvent',{type:'mousePressed',x:btnInfo.x,y:btnInfo.y,button:'left',buttons:1,clickCount:1})
+          await c.send('Input.dispatchMouseEvent',{type:'mouseReleased',x:btnInfo.x,y:btnInfo.y,button:'left',buttons:0,clickCount:1})
+        } else {
+          await c.send('Input.dispatchKeyEvent',{type:'rawKeyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13})
+          await c.send('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13})
+        }
+        await sleep(3000)
+        const afterImg = await countMyImg()
+        const readback = afterImg > beforeImg
+        return out({
+          ok: readback, sent: readback, to:target.nick, to_sec_uid:target.sec_uid||undefined,
+          image: IMAGE, mime: up.mime, matched_by: TOID ? 'sec_uid':'nickname(唯一)',
+          readback, my_images_before: beforeImg, my_images_after: afterImg, chrome: chromed,
+          error: readback ? undefined : '发送动作点了，但回读没看到我发的图片消息（可能仍在上传/审核）—— 不等于没发，请人工看一眼。',
+        })
+      } finally {
+        if (upCleanup) { try { upCleanup() } catch { /* ignore */ } }
+      }
     }
 
     // 点输入框

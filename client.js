@@ -923,7 +923,7 @@ window.__ModuleLoader__.load({
               : '关着：只看文案和数字，不看画面。',
             cfg.watchFrames, { onLabel: '✅ 已打开看画面', offLabel: '已关闭看画面' }),
           engNum('frameTargetSec', '每多少秒抽一帧（2–8 秒，默认 3；越小越全、越费 token）', 2, 8, (n) => `每 ${n} 秒一帧`),
-          engNum('frameMax', '每条视频关键帧上限（4–20，默认 12，封顶控 token）', 4, 20, (n) => `最多 ${n} 帧`),
+          engNum('frameMax', '每条视频关键帧上限（4–30，默认 30；约 90 秒以上长视频才到顶，帧越多越费 token）', 4, 30, (n) => `最多 ${n} 帧`),
           engNum('frameWidth', '关键帧宽度（320 / 480 / 640 / 720，默认 640；填别的会归 640）', 320, 720, (n) => `帧宽 ${n}px`),
           engNum('frameCount', '时长未知时的兜底帧数（2–12，默认 3；正常视频按上面的秒数自适应）', 2, 12, (n) => `兜底 ${n} 帧`),
           engToggle('useOfficialSubtitle', '优先用抖音官方字幕（推荐开，最省最稳）',
@@ -941,7 +941,7 @@ window.__ModuleLoader__.load({
           h('div', { 'data-dy-title': '' }, '🐟 表情包（自己收集 · 安全审核后再发）'),
           h('div', { 'data-dy-sub': '', style: { marginBottom: '8px' } },
             '大肥鱼会从评论区和聊天里收集表情。新表情先由它自己看图审核：只放行可爱 / 萌 / 抽象 / 大肥鱼 / 治愈这类无不良的，'
-            + '色情、暴力、血腥、恐怖、恶心、违法、涉政、辱骂、未成年向一律拦掉。评论可发平台贴纸（私信发图 web 端不保证）。'
+            + '色情、暴力、血腥、恐怖、恶心、违法、涉政、辱骂、未成年向一律拦掉。平台贴纸走发布接口，图片/GIF 走上传（评论+私信，需该号有图片权限，没入口会如实返回 image_uploader）。'
             + '待审/已审表情可用 douyin_sticker_list、douyin_sticker_review 查看与拍板。'),
           engToggle('collectSticker', '自动收集看到的表情（推荐开）',
             cfg.collectSticker !== false ? '✅ 开着：评论/聊天里看到的表情会进库，先待审。' : '关着：不收集任何表情。',

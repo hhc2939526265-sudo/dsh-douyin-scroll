@@ -89,7 +89,7 @@ node "<插件目录>/tools/mcp-server.mjs"
 | `douyin_dm` | 发一条私信 |
 | `douyin_comment_reply` | 发评论 / 回复某条评论。**`mode:"api"`（默认）直接回复楼层；`mode:"ui"` 真 @ 顶层**。回楼中楼要额外传 `root_comment_id`（楼根，通知才发给对方而不是楼主）。⭐ **不传 comment_id = 主动顶层评论**（受每日上限）；**回复别人**再传 `reply_to_uid`（同人每天≤2 次）+ `reply_to_text`（对方原文，恶意/抬杠/引流会被拦） |
 | `douyin_comment_mention` | 同上，等价于 `mode:"ui"` 的便捷入口（真 @、UI 点选）—— 2026-10-23 新增 |
-| `douyin_comment_sticker` | **发表情包**（2026-10-25 新增）：传 `sticker_key`，只发审核通过的平台贴纸；给 `comment_id` 是回某条、不给是顶层表情评论。受风控节奏 + 每日贴纸上限，需 `confirm:true`；自定义图片/GIF 会返回 `unsupported` |
+| `douyin_comment_sticker` | **发表情包**（2026-10-25 新增）：传 `sticker_key`，只发审核通过的表情；给 `comment_id` 是回某条、不给是顶层表情评论。受风控节奏 + 每日贴纸上限，需 `confirm:true`；**有平台贴纸 id 走发布接口，无 id 的图片/GIF 走 UI 上传**，没入口返回 `image_uploader` |
 
 ### ⭐⭐ 该用哪个：**有评论可回就回复，没评论可回才 @**（2026-10-23 定稿）
 
@@ -336,5 +336,5 @@ node "<插件目录>/tools/mcp-server.mjs"
 - **不做**回读核实：卡片/私信发完，MCP 版只报"发出去了"，真落地没落地请使用者自己看一眼
 - **能做**真 @：`douyin_comment_mention`（UI 点选，2026-10-23 加）；但它要起 Chrome、20-40 秒、昵称必须搜得到
 - **能看**画面（封面 + 自适应关键帧 `frames`，见规矩 ③）；**能拿台词**：优先抖音官方字幕，没有字幕时若装了 `faster-whisper` 并开启可本地转写；都没有就老实标「无台词」，不假装听懂
-- **能发的表情**仅限评论区平台贴纸（`douyin_comment_sticker`）且必须审核通过；自定义图片/GIF 评论、私信图片在 web 端不保证成功
+- **能发的表情**仅限审核通过的：平台贴纸走发布接口（`douyin_comment_sticker`）、图片/GIF 走 UI 上传（评论+私信，`douyin_dm` 传 `sticker_key` 只发老大）；找不到图片入口会返回 `image_uploader`，不硬试、不刷屏
 - **不联网上传**任何东西；Cookie 只在本机

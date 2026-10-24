@@ -181,8 +181,8 @@ export const Config = !z ? undefined : z.object({
   frameCount: z.natural().default(3).extra('volatile', true),
   /** ⭐ v0.4.0 自适应抽帧：每多少秒一帧（2–8，默认 3）——长视频自然多抽、内容更完整 */
   frameTargetSec: z.number().default(3).extra('volatile', true),
-  /** 每条视频关键帧硬上限（4–20，默认 12）——封顶控制 token */
-  frameMax: z.natural().default(12).extra('volatile', true),
+  /** 每条视频关键帧硬上限（4–30，默认 30）——封顶控 token；约 90 秒以上的长视频才会到顶 */
+  frameMax: z.natural().default(30).extra('volatile', true),
   /** 关键帧宽度（320/480/640/720，默认 640）——够看清内容又不过大，控 token */
   frameWidth: z.natural().default(640).extra('volatile', true),
   /** ⭐ v0.4.0 语音识别：优先用抖音官方字幕（默认开，最省最稳） */
@@ -348,7 +348,7 @@ export function apply(ctx, config) {
     autoReply: false, replyPerDay: 10, replyPerPerson: 2, replyKindOnly: true,
     // ⭐ 看画面（2026-10-24）/ 自适应抽帧 + 台词（2026-10-25 v0.4.0）
     watchFrames: true, frameCount: 3,
-    frameTargetSec: 3, frameMax: 12, frameWidth: 640,
+    frameTargetSec: 3, frameMax: 30, frameWidth: 640,
     useOfficialSubtitle: true, useAsr: false, asrModel: 'small', spokenMaxChars: 600,
     // ⭐ 表情包（2026-10-25 v0.4.0）：收集 / 安全审核 / 使用（贴纸 id）
     collectSticker: true, useSticker: false, stickerPerDay: 5, stickerSafeOnly: true, stickerAutoReview: true,
@@ -417,7 +417,7 @@ export function apply(ctx, config) {
     // ⭐ 看画面 / 风控（2026-10-24）/ 自适应抽帧 + 台词 + 表情包（2026-10-25）
     if ('frameCount' in p) p.frameCount = Math.max(2, Math.min(Number(p.frameCount) || 3, 12))
     if ('frameTargetSec' in p) p.frameTargetSec = Math.max(2, Math.min(Number(p.frameTargetSec) || 3, 8))
-    if ('frameMax' in p) p.frameMax = Math.max(4, Math.min(Number(p.frameMax) || 12, 20))
+    if ('frameMax' in p) p.frameMax = Math.max(4, Math.min(Number(p.frameMax) || 30, 30))
     if ('frameWidth' in p) {
       const w = Number(p.frameWidth) || 640
       p.frameWidth = [320, 480, 640, 720].includes(w) ? w : 640
@@ -1093,7 +1093,8 @@ export function apply(ctx, config) {
     parameters: {
       to: { type: 'string', description: '发给谁（抖音昵称，只用于显示；leave空用配置 dmTo）' },
       to_id: { type: 'string', description: '⭐ 发给谁：**稳定 id**（sec_uid 或 uid）。重名时**必须**给这个；留空用配置 dmToId' },
-      text: { type: 'string', description: '私信正文（与 from_list 二选一）' },
+      text: { type: 'string', description: '私信正文（与 from_list / sticker_key 三选一）' },
+      sticker_key: { type: 'string', description: '⭐ 给老大发一张图片表情：表情库 key（必须已审核 approved）；走聊天框图片上传，受每日贴纸上限约束' },
       from_list: { type: 'boolean', description: '用最近一轮刷到的清单当正文（默认 false）' },
       top: { type: 'number', description: 'from_list 时放几条（默认 3，最多 5）' },
       dry: { type: 'boolean', description: '只验证通道，不真发（默认 false）' },
@@ -1116,7 +1117,61 @@ export function apply(ctx, config) {
         }
       }
       const text = String(args.text || '').trim()
-      if (!file && !text) return { ok: false, error: '正文为空', hint: '传 text，或 from_list=true' }
+      // ⭐ 发图片表情（sticker_key）：只发给老大，走聊天框图片上传
+      const skey = String(args.sticker_key || '').trim()
+      if (skey) {
+        const st = listStickers(stateDir, { status: 'all', limit: 500 }).find((x) => x.key === skey)
+        if (!st) return { ok: false, error: '表情库里没有这个 key（先 douyin_sticker_list 看）' }
+        if (cfg.stickerSafeOnly !== false && st.status !== 'approved') {
+          return {
+            ok: false, blocked: 'not_approved', status: st.status,
+            error: st.status === 'blocked' ? '这张表情审核没过（含不良/不适），不能发' : '这张表情还没审核：先 Read 它的 thumb，用 douyin_sticker_review 放行',
+          }
+        }
+        const imgUrl = String(st.url || st.thumb || '').trim()
+        if (!imgUrl) return { ok: false, unsupported: 'no_image_url', error: '这张表情没有可上传的图片地址' }
+        const perDay = Math.max(0, Number(cfg.stickerPerDay) || 0)
+        const usedToday = stickerSentToday(stateDir)
+        if (perDay === 0) return { ok: false, blocked: 'sticker_cap', error: '每日贴纸额度为 0（设置里「每天最多发几个表情」）' }
+        if (usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
+        if (args.confirm !== true) {
+          return {
+            ok: true, sent: false, needsConfirm: true, kind: 'image', to, to_id: toId || undefined,
+            sticker: { key: st.key, name: st.name, kind: st.kind, thumb: st.thumb, url: imgUrl },
+            quota: { stickerToday: `${usedToday}/${perDay}` },
+            note: '没发送 —— 确认这张表情合适后，用 confirm:true 再调一次（只发给老大）。',
+          }
+        }
+        if (!args.dry) {
+          const g = await awaitGate(stateDir, 'dm', rateOpts())
+          if (!g.ok) return rateBlocked(g)
+        }
+        const argv = []
+        if (to) argv.push('--to', to)
+        if (toId) argv.push('--to-id', toId)
+        argv.push('--image', imgUrl)
+        if (args.dry) argv.push('--dry')
+        const r = runNodeTool('im-send.mjs', argv, { timeout: 300_000 })
+        const res = pickJson(r.stdout)
+        if (!res) { if (!args.dry) rateFailFromText('dm', r.stdout, r.stderr); return { ok: false, error: '图片发送器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) } }
+        if (res.unavailable === 'image_uploader') {
+          return { ok: false, sent: false, unavailable: 'image_uploader', error: res.error || '聊天框没有图片上传入口（该号/页面没私信图片能力）；评论区平台贴纸不受影响。' }
+        }
+        if (res.sent && !args.dry) {
+          markAction(stateDir, 'dm', rateOpts())
+          markStickerSent(stateDir, st.key)
+          noteDm('image', res.to_sec_uid || toId)
+          try {
+            const secUid = String(res.to_sec_uid || toId || '').trim()
+            if (secUid) noteSent(stateDir, secUid, res.to || to, `[图片表情]${st.name || ''}`, 'image')
+          } catch { /* 记不上不影响 */ }
+          log(`dm-image -> ${res.to || to}: 图片表情已发`)
+        } else if (!res.ok && !res.sent && !args.dry) {
+          rateFailFromText('dm', res, r.stdout, r.stderr)
+        }
+        return res
+      }
+      if (!file && !text) return { ok: false, error: '正文为空', hint: '传 text，或 from_list=true，或 sticker_key 发图片表情' }
       // ⭐ 视频链接拦截：正文里塞了抖音视频地址 ⇒ 必须改成卡片（卡片才可点、才算分享）
       if (/v\.douyin\.com|douyin\.com\/video|iesdouyin\.com\/share|\.iesdouyin\.net/i.test(text)) {
         return {
@@ -2072,11 +2127,11 @@ export function apply(ctx, config) {
 
   tool({
     name: 'douyin_comment_sticker',
-    description: '⭐ 在评论区**发一个表情包贴纸**（平台贴纸，走评论 publish 原生 sticker_id，最稳）。'
+    description: '⭐ 在评论区**发一个表情包**（平台贴纸优先；自定义图片/GIF 也能走评论框图片上传）。'
       + '贴纸来自你自己收集、且已通过 douyin_sticker_review 安全审核的表情库。'
       + '只发表情（不带文字）；给 comment_id 就是回某条（楼中楼），不给就是顶层表情评论。'
       + '🔴 同样受风控节奏、每日主动评论/回复上限、**每日贴纸上限**约束；要 confirm 才真发。'
-      + '自定义图片/GIF（没有 sticker_id 的）web 端发不了评论，会明确告诉你 unsupported。',
+      + '有 sticker_id 的平台贴纸走发布接口（最稳）；没有 id 的图片/GIF 走 UI 上传，需要该号有图片评论权限（老号/实名号通常有），没有入口会明确返回 image_uploader，不会谎报。',
     parameters: {
       aweme_id: { type: 'string', description: '作品/图文 id' },
       sticker_key: { type: 'string', description: '表情库贴纸 key（douyin_sticker_list 返回的 key）；推荐用这个' },
@@ -2124,11 +2179,13 @@ export function apply(ctx, config) {
             : '这张表情还没审核：先 Read 它的 thumb，用 douyin_sticker_review 判定 approve 才能发',
         }
       }
-      if (!sticker.sticker_id) {
+      // 分流：有平台 sticker_id 走 API（最稳）；没有的自定义图片/GIF 走 UI 上传（老号图片评论）
+      const mode = sticker.sticker_id ? 'sticker' : 'image'
+      const imageUrl = String(sticker.url || sticker.thumb || '').trim()
+      if (mode === 'image' && !imageUrl) {
         return {
-          ok: false, unsupported: 'custom_image_comment',
-          error: '这是自定义图片/GIF（没有平台 sticker_id），抖音 web 评论接口发不了图片评论',
-          hint: '平台贴纸（评论自带贴纸）才走得了这条；自定义图只能在私信里走 UI 尽力而为，不保证成功。',
+          ok: false, unsupported: 'custom_image_no_url',
+          error: '这张自定义图片/GIF 没有可取的图片地址（url/thumb 都为空），无法上传',
         }
       }
       // ③ 每日贴纸额度
@@ -2163,11 +2220,13 @@ export function apply(ctx, config) {
       // ⑤ 确认闸（先把草稿给用户看）
       if (args.confirm !== true) {
         return {
-          ok: true, sent: false, needsConfirm: true,
+          ok: true, sent: false, needsConfirm: true, send_mode: mode,
           aweme_id: aweme, comment_id: replyTo || '(顶层表情评论)',
-          sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name, tags: sticker.tags, thumb: sticker.thumb },
+          sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name, kind: sticker.kind, tags: sticker.tags, thumb: sticker.thumb, url: imageUrl || undefined },
           quota: { stickerToday: `${usedToday}/${perDay}` },
-          note: '没发送 —— 确认这张表情合适、且没认错视频后，用 confirm:true 再调一次。',
+          note: mode === 'image'
+            ? '没发送 —— 这是自定义图片/GIF，将走评论框图片上传（需要该号有图片评论权限）。确认合适且没认错视频后 confirm:true。'
+            : '没发送 —— 确认这张表情合适、且没认错视频后，用 confirm:true 再调一次。',
         }
       }
 
@@ -2176,18 +2235,37 @@ export function apply(ctx, config) {
       const gate = await awaitGate(stateDir, rlKind, rateOpts())
       if (!gate.ok) return rateBlocked(gate)
 
-      // ⑦ 发送（comment-api.mjs 的 --sticker 走 publish 的 sticker_id）
-      const argv = ['--aweme', aweme, '--sticker', String(sticker.sticker_id)]
-      if (replyTo) argv.push('--reply', replyTo)
-      if (rootCid) argv.push('--root', rootCid)
-      const r = runNodeTool('comment-api.mjs', argv, { timeout: 260_000 })
+      // ⑦ 发送：
+      //    sticker（平台贴纸）→ comment-api.mjs --sticker（publish 原生 sticker_id，最稳）
+      //    image（自定义图片/GIF）→ comment-image-ui.mjs --url（CDP 塞进评论框上传，老号图片评论权限）
+      let toolName, argv
+      if (mode === 'sticker') {
+        toolName = 'comment-api.mjs'
+        argv = ['--aweme', aweme, '--sticker', String(sticker.sticker_id)]
+        if (replyTo) argv.push('--reply', replyTo)
+        if (rootCid) argv.push('--root', rootCid)
+      } else {
+        toolName = 'comment-image-ui.mjs'
+        argv = ['--aweme', aweme, '--url', imageUrl]
+        if (replyTo) argv.push('--reply', replyTo)
+      }
+      const r = runNodeTool(toolName, argv, { timeout: 300_000 })
       const res = pickJson(r.stdout)
       if (!res) {
         rateFailFromText(rlKind, r.stdout, r.stderr)
-        return { ok: false, error: '贴纸发送器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) }
+        return { ok: false, error: '表情发送器没返回可解析结果', send_mode: mode, stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) }
       }
-      if (res.need_root || (!res.ok && /判不出楼根/.test(String(res.error || '')))) {
+      // 楼根判定只在平台贴纸 API 通路需要
+      if (mode === 'sticker' && (res.need_root || (!res.ok && /判不出楼根/.test(String(res.error || ''))))) {
         return { ok: false, need_root: true, ...res, hint: '楼中楼判不出楼根，先 douyin_at_me/douyin_notices 拿 root_comment_id 再传进来（没发出）' }
+      }
+      // 图片通路：该号没图片评论入口 / 预览没出现 —— 是"没发出去"，不算风控失败，不熔断
+      if (mode === 'image' && res.unavailable === 'image_uploader') {
+        return {
+          ok: false, sent: false, send_mode: 'image', unavailable: 'image_uploader',
+          error: res.error || '这个号 / 这条视频没有图片评论入口（图片评论是灰度权限）；平台贴纸表情不受影响。',
+          stage: res.stage,
+        }
       }
       if (res.ok) {
         markAction(stateDir, rlKind, rateOpts())
@@ -2195,22 +2273,25 @@ export function apply(ctx, config) {
         // 与文字评论共用同一本互动额度账（主动评论 / 回复 + 同人计数）
         try {
           if (replyTo) {
-            const c = countReply(stateDir, replyToUid)
-            if (replyToUid) log(`engage: 表情回复 ${replyToUid}（该人今天 ${c.personUsed} 次 / 共 ${c.replies} 次）`)
+            const cc = countReply(stateDir, replyToUid)
+            if (replyToUid) log(`engage: 表情回复 ${replyToUid}（该人今天 ${cc.personUsed} 次 / 共 ${cc.replies} 次）`)
           } else {
             const n = countProactiveComment(stateDir)
             log(`engage: 主动表情评论 +1（今天 ${n} 条）`)
           }
         } catch { /* 记账失败不影响发送结果 */ }
-        try { noteMyComment(stateDir, aweme, { sticker: sticker.sticker_id, text: `[表情]${sticker.name || ''}` }) } catch { /* 记不上不影响 */ }
+        try {
+          const label = mode === 'sticker' ? `[表情]${sticker.name || ''}` : `[图片表情]${sticker.name || ''}`
+          noteMyComment(stateDir, aweme, { sticker: sticker.sticker_id || '', text: label })
+        } catch { /* 记不上不影响 */ }
         if (replyTo && aweme) { try { markSeen(stateDir, aweme, [replyTo]) } catch { /* ignore */ } }
-        log(`comment-sticker -> ${aweme}: 表情 ${sticker.sticker_id} 已发（${rlKind}）`)
+        log(`comment-sticker -> ${aweme}: ${mode === 'image' ? '图片表情' : '贴纸'} 已发（${rlKind}）`)
       } else {
         rateFailFromText(rlKind, res, r.stdout, r.stderr)
       }
       return {
-        ...res, sent: Boolean(res.ok), kind: rlKind,
-        sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name },
+        ...res, sent: Boolean(res.ok), kind: rlKind, send_mode: mode,
+        sticker: { key: sticker.key, sticker_id: sticker.sticker_id, name: sticker.name, kind: sticker.kind },
         stickerStats: stickerStats(stateDir),
       }
     },

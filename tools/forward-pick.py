@@ -216,12 +216,12 @@ def frame_plan(dur_s, cfg):
     """
     自适应抽帧数量（要「内容基本完整、又不太费 token」）：
       · 按 frameTargetSec 秒/帧 的密度，随视频时长增减（长视频自然多抽，不漏关键画面）；
-      · 上下限 frameMax（默认 12）封顶控成本；时长未知时退回 frameCount（默认 3）。
+      · 上下限 frameMax（默认 30）封顶控成本；时长未知时退回 frameCount（默认 3）。
     """
     target = float(cfg.get("frameTargetSec") or 3.0) or 3.0
-    fmax = int(cfg.get("frameMax") or 12)
+    fmax = int(cfg.get("frameMax") or 30)
     fb = int(cfg.get("frameCount") or 3)
-    fmax = max(2, min(fmax, 20))
+    fmax = max(2, min(fmax, 30))
     if dur_s and dur_s > 0:
         n = int(round(dur_s / target))
         return max(2, min(n, fmax))
@@ -531,7 +531,7 @@ def main():
         meta_note = {
             "frames": "on",
             "frame_target_sec": cfg.get("frameTargetSec", 3.0),
-            "frame_max": cfg.get("frameMax", 12),
+            "frame_max": cfg.get("frameMax", 30),
             "frame_width": cfg.get("frameWidth", 640),
             "ffmpeg": bool(find_ffmpeg()),
             "official_subtitle": cfg.get("useOfficialSubtitle", True),

@@ -29,13 +29,13 @@ console.log('1. 文件清单')
 const required = [
   'package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'requirements.txt',
   'lib/hostdeps.mjs', 'lib/state.mjs', 'lib/credential.mjs', 'lib/notify.mjs', 'lib/toast.mjs', 'lib/uvfetch.mjs',
-  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs', 'lib/ratelimit.mjs', 'lib/stickers.mjs',
+  'lib/paths.mjs', 'lib/chrome.mjs', 'lib/engage.mjs', 'lib/tastes.mjs', 'lib/ratelimit.mjs', 'lib/stickers.mjs', 'lib/img-upload.mjs',
   'prompts/duty.md', 'prompts/persona.default.md', 'prompts/sample-candidates.json',
   // 给别的 AI / MCP 用的那一层
   'AI-USAGE.md', 'tools/mcp-server.mjs', 'tools/doctor.mjs', 'check-client.mjs',
   // 采集 / 发送这一层：全是自带的脚本（2026-10-21 起不再有 vendor/ 里的内置 MCP）
   'tools/forward-pick.py', 'tools/forward-run.mjs', 'tools/notice-read.py', 'tools/api-comments.py',
-  'tools/comment-api.mjs', 'tools/comment-delete.mjs', 'tools/card-share.mjs', 'tools/im-send.mjs',
+  'tools/comment-api.mjs', 'tools/comment-image-ui.mjs', 'tools/comment-delete.mjs', 'tools/card-share.mjs', 'tools/im-send.mjs',
   'tools/qr-login.mjs', 'tools/session-guard.py', 'tools/dy-signer.mjs',
 ]
 for (const f of required) {
@@ -1429,6 +1429,57 @@ console.log('STKRESULT ' + JSON.stringify({a:a.status, b:b.status, rb:rb.status,
       ok('贴纸库行为正确：黑名单直拦→视觉审核→只发approved→每日计数')
     } else bad(`贴纸库行为不符：${sm[1]}`)
   } else bad(`贴纸库动态测试没跑通：${String(sr.stderr || sr.stdout || '').slice(0, 200)}`)
+
+  /* ── 4s. v0.4.1：每条封顶 30 帧 + 图片/GIF 表情真能发（评论 + 私信）── */
+  const iuFile = join(here, 'lib', 'img-upload.mjs')
+  const iu = existsSync(iuFile) ? readFileSync(iuFile, 'utf8') : ''
+  const ciuFile = join(here, 'tools', 'comment-image-ui.mjs')
+  const ciu = existsSync(ciuFile) ? readFileSync(ciuFile, 'utf8') : ''
+  const imNow = readFileSync(join(here, 'tools', 'im-send.mjs'), 'utf8')
+
+  // ① 每条封顶 30 帧
+  if (/frameMax: z\.natural\(\)\.default\(30\)/.test(idx) && /frameMax: 30/.test(idx)
+      && /Math\.max\(4, Math\.min\(Number\(p\.frameMax\)[\s\S]*?, 30\)\)/.test(idx)) {
+    ok('frameMax 默认与上限提到 30（schema/默认/clamp）')
+  } else bad('frameMax 未提到 30')
+  if (/min\(fmax, 30\)/.test(fp) && /cfg\.get\("frameMax"\) or 30/.test(fp)) ok('forward-pick.py 硬封顶 30')
+  else bad('forward-pick.py 未硬封顶 30')
+
+  // ② 通用 CDP 图片上传 helper
+  if (iu && /export async function fetchImageInPage/.test(iu) && /export async function locateImageInput/.test(iu)
+      && /export async function injectFile/.test(iu) && /export async function uploadImageByUrl/.test(iu)
+      && /DOM\.setFileInputFiles/.test(iu)) {
+    ok('lib/img-upload.mjs 提供页面取图→临时文件→CDP 注入 file input')
+  } else bad('lib/img-upload.mjs 缺关键导出/CDP 注入')
+
+  // ③ 评论图片/GIF UI 发送器，找不到入口是三态（不谎报）
+  if (ciu && /uploadImageByUrl\(c, URL, 'comment'\)/.test(ciu) && /unavailable: 'image_uploader'/.test(ciu) && /waitForPreview/.test(ciu)) {
+    ok('comment-image-ui.mjs 走评论框图片上传，无入口三态返回 image_uploader')
+  } else bad('comment-image-ui.mjs 缺上传/三态/预览')
+
+  // ④ 私信图片：im-send --image 走聊天框上传并回读
+  if (/--image/.test(imNow) && /uploadImageByUrl\(c, IMAGE, 'dm'\)/.test(imNow) && /unavailable: 'image_uploader'/.test(imNow)) {
+    ok('im-send.mjs 支持 --image 走聊天框图片上传并回读')
+  } else bad('im-send.mjs 缺 --image 图片发送')
+
+  // ⑤ douyin_comment_sticker 对自定义图片不再一刀切 unsupported，改为 UI 分流
+  if (!/unsupported: 'custom_image_comment'/.test(idx) && !/unsupported: 'custom_image_comment'/.test(mcp)
+      && /const mode = sticker\.sticker_id \? 'sticker' : 'image'/.test(idx)
+      && /const mode = sticker\.sticker_id \? 'sticker' : 'image'/.test(mcp)
+      && /comment-image-ui\.mjs/.test(idx) && /comment-image-ui\.mjs/.test(mcp)) {
+    ok('douyin_comment_sticker 对自定义图片改为 UI 上传分流（不再直接 unsupported）')
+  } else bad('comment_sticker 图片分流未接好')
+  if (/res\.unavailable === 'image_uploader'/.test(idx) && /j\.unavailable === 'image_uploader'/.test(mcp)) {
+    ok('图片上传入口缺失三态透传（host+MCP，不熔断、不谎报）')
+  } else bad('图片入口缺失未三态透传')
+
+  // ⑥ 私信 douyin_dm 支持 sticker_key 发图片给老大（host+MCP）
+  const dmSeg = idx.slice(idx.indexOf("name: 'douyin_dm'"))
+  const dmSegM = mcp.slice(mcp.indexOf("name: 'douyin_dm'"))
+  if (/sticker_key/.test(dmSeg) && /'--image', imgUrl/.test(dmSeg)) ok('host douyin_dm 支持 sticker_key 发图片给老大')
+  else bad('host douyin_dm 未接图片表情')
+  if (/sticker_key/.test(dmSegM) && /'--image', imgUrl/.test(dmSegM)) ok('MCP douyin_dm 支持 sticker_key 发图片给老大')
+  else bad('MCP douyin_dm 未接图片表情')
 } catch (e) { bad(`v0.4.0 检查失败：${e.message}`) }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
