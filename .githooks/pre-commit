@@ -1,0 +1,49 @@
+#!/bin/sh
+# ════════════════════════════════════════════════════════════════════════════
+# pre-commit —— 提醒：改人设 / 改文档不该发版本号
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 为什么有这条（2026-10-23）：
+#   号主问「提交这么多版本是因为都有重大bug吗」。查下来 0.2.6~0.2.9 四个版本
+#   全是改人设语气，其中一个改的 prompts/persona.md **根本不在发布包里**
+#   （.gitignore 排除了它）——拿公开版本号记私人笔记。
+#
+# 版本号只跟「装插件的人会感觉到变化」的东西走：
+#   该发：工具行为变了 / bug 修了 / 面板变了 / 配置项变了
+#   不该发：只改我自己的人设、只改内部文档、只改自检断言
+#
+# 这个 hook **只提醒，不拦** —— 有时候确实要改版本，判断留给当场。
+# ════════════════════════════════════════════════════════════════════════════
+
+STAGED="$(git diff --cached --name-only)"
+VERSION_CHANGED="$(echo "$STAGED" | grep -x 'package.json' || true)"
+[ -z "$VERSION_CHANGED" ] && exit 0
+
+# package.json 改了，但 version 行有没有变？
+VER_DIFF="$(git diff --cached -U0 -- package.json | grep -E '^[+-]\s*"version"' || true)"
+[ -z "$VER_DIFF" ] && exit 0
+
+# 这次改动里有没有真正影响使用者的文件？
+BEHAVIOR="$(echo "$STAGED" | grep -E '^(index\.js|client\.js|tools/|lib/)' || true)"
+PERSONA_ONLY="$(echo "$STAGED" | grep -E '^(prompts/|AGENTS\.md|selfcheck\.mjs|AI-USAGE\.md|README\.md|GUIDE\.md)' || true)"
+
+if [ -z "$BEHAVIOR" ] && [ -n "$PERSONA_ONLY" ]; then
+  cat <<'WARN'
+
+┌────────────────────────────────────────────────────────────────────┐
+│  ⚠️  你在改版本号，但这次只动了人设 / 文档 / 自检                    │
+└────────────────────────────────────────────────────────────────────┘
+
+  index.js / client.js / tools/ / lib/ 一行都没改。
+  装插件的人**感觉不到任何变化** —— 这种改动不该占版本号。
+
+  建议：把 package.json 撤出这次提交
+        git restore --staged package.json
+  然后 commit message 写 docs(persona): …（不带版本号）
+
+  真的该发版本？（比如修了自检漏掉的 bug）那就继续，这条只提醒不拦。
+
+WARN
+fi
+
+exit 0

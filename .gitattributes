@@ -1,0 +1,14 @@
+# 统一换行符：仓库里存 LF，检出时 Windows 也保持 LF
+# （不设的话 git 会在 Windows 上自动转 CRLF，每次提交都有一堆 warning，
+#   而且跨平台协作时 diff 会全是换行符噪音）
+* text=auto eol=lf
+
+# 二进制文件不要碰
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.tgz binary

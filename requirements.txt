@@ -1,0 +1,12 @@
+# dsh-douyin-scroll 主依赖
+# ---------------------------------------------------------------------------
+# 以前这里是从 vendor/douyin-mcp/requirements.txt 装的，里面带 mcp + 一堆浏览器驱动。
+# 现在采集/发送全走「HTTP + 无头 Chrome」，只留两个真用得上的：
+#
+#   curl_cffi —— 能在 Python 里模拟 Chrome 的 TLS 指纹。
+#                抖音对普通 requests 的握手很敏感，用它可以少踩很多坑。
+#                （forward-pick.py / notice-read.py / session-guard.py 都用它）
+#   httpx     —— 签名后打正式接口（api-reply.py / api-comments.py）
+# ---------------------------------------------------------------------------
+curl_cffi>=0.11
+httpx>=0.27

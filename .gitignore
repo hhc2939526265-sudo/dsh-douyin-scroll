@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────
+# 本地私有配置 —— **绝不发布**
+#   prompts/persona.md 是开发机上的本地配置，只属于本机。
+#   发布包里带的是 prompts/persona.default.md（中性默认），谁装了都能用。
+#   使用者自己那份写在 $DOUYIN_HOME/persona.md，不在本仓库里。
+# ─────────────────────────────────────────────────────────────
+prompts/persona.md
+persona.md
+
+# ─────────────────────────────────────────────────────────────
+# 运行时数据 / 凭证 —— 一律不进仓库
+# （家在 $DSH_HOME/douyin-duty，本来就不在这个包里；这里只是防手滑拖进来）
+# ─────────────────────────────────────────────────────────────
+douyin_cookie.txt
+*.cookie
+*credential*.json
+account.json
+following.json
+config.json
+health.json
+collector.json
+notice.json
+seen.md
+charter.sha256
+reason.txt
+round-evidence.json
+forward-pick.json
+forward-msg.txt
+*.log
+
+chrome-profile/
+signer/
+toast/
+state/
+out/
+digest/
+inbox/
+
+# ─────────────────────────────────────────────────────────────
+# Python / Node 环境
+# ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+
+# ─────────────────────────────────────────────────────────────
+# 编辑器 / 系统垃圾
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.tmp
+_probe-*
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ─────────────────────────────────────────────────────────────
+# 排查用的临时脚本 / 截图（**不进仓库**）
+#   里面常有本机路径、真实会话昵称、聊天预览截图
+# ─────────────────────────────────────────────────────────────
+_scratch/
+*.png

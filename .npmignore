@@ -1,0 +1,33 @@
+# ============================================================================
+# .npmignore —— 发到 npm 时**不打包**的东西
+# ============================================================================
+
+# 🔴🔴🔴 最关键的一条：本地私有配置文件，绝不随包发布
+#   为什么需要单独一条：package.json 的 files 里写的是整个 `prompts` 目录，
+#   npm 会**递归**打进去 —— 而且 npm **不认 .gitignore**。
+#   2026-10-22 实测：不发这条的话，prompts/persona.md 真的进了 tgz。
+#   发布包只能有 persona.default.md（中性默认），使用者自己的写在 $DOUYIN_HOME/persona.md。
+prompts/persona.md
+persona.md
+
+# 本机跑 Python 生成的字节码（别人的 Python 版本对不上，白占体积）
+tools/__pycache__/
+tools/**/*.pyc
+__pycache__/
+*.pyc
+*.pyo
+
+# 开发/测试用的，使用者不需要
+_probe-*
+_msg*.txt
+_pkgtest/
+
+# 本机运行时数据（本来就在 $DSH_HOME，这里只是防手滑）
+config.json
+*.log
+out/
+memory/
+chrome-profile/
+.venv/
+venv/
+node_modules/
