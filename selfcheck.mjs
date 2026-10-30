@@ -210,12 +210,13 @@ try {
   const idx = readFileSync(join(here, 'index.js'), 'utf8')
   if (/im-http\.py/.test(idx)) ok('douyin_im_read 先走 HTTP 快路径（im-http.py）')
   else bad('index.js 没接 im-http.py —— 快路径丢了')
-  if (/if \(toId\)/.test(idx.slice(idx.indexOf('douyin_im_read'), idx.indexOf('douyin_im_read') + 4000))) {
+  const imHttpAt = idx.indexOf(`'im-http.py', ['--read'`)
+  if (imHttpAt > 0 && /if \(toId\)/.test(idx.slice(Math.max(0, imHttpAt - 500), imHttpAt))) {
     ok('有 to_id（sec_uid）才走快路径 —— 不给 sec_uid 不白付 HTTP 往返')
   } else bad('快路径没有 to_id 前置条件 —— 读陌生人会白付一次往返')
   if (/http\.matched/.test(idx)) ok('命中只认 matched（反查核验通过的那个），不认别的')
   else bad('没有 matched 判定 —— 身份铁闸没接上')
-  if (/im-send\.mjs/.test(idx) && /陌生人/.test(idx.slice(idx.indexOf('douyin_im_read'), idx.indexOf('douyin_im_read') + 4000))) {
+  if (/im-send\.mjs/.test(idx) && /陌生人/.test(idx.slice(idx.indexOf('douyin_im_read'), idx.indexOf('douyin_im_read') + 9000))) {
     ok('读不到时退回浏览器路径（陌生人消息只有那条路能读）')
   } else bad('没有浏览器兜底 —— 陌生人的私信会读不到')
   if (/via:\s*'http'/.test(idx)) ok('返回里带 via 标明走的哪条路')
@@ -737,8 +738,8 @@ try {
   // ② 拒绝文案里必须引导"直接回复"，而不是教他发顶层
   if (/你已经有 comment_id 了 ⇒ \*\*不需要 @\*\*/.test(idx)) ok('拒绝文案引导"直接回复就行，不用 @"（不把人往顶层推）')
   else bad('拒绝文案没引导直接回复 —— 调用方会以为"要通知人只能用 @"')
-  // ③ 值班轮的 commentAtMe 必须用 mode=ui（推视频、没有评论可回），且写明"这是 @ 唯一该用的场景"
-  if (/这是 @ 唯一该用的场景/.test(idx)) ok('值班轮提示词写明：推视频（无评论可回）才用 @')
+  // ③ 值班轮提示词要写清 @ 什么时候用（2026-10-26 起：两路平权，不再"只能推视频"）
+  if (/两边都可以，没有先后偏好/.test(idx)) ok('值班轮提示词写明：私信分享 与 评论区 @ 两路平权')
   else bad('值班轮提示词没说清"什么时候该用 @"—— 模型可能拿 @ 去回复人')
   // ④ at-me 自动回复脚本必须走 api 直接回复（不是 UI 点选）
   const atw = (() => { try { return readFileSync(join(here, 'tools', 'at-me-watch.mjs'), 'utf8') } catch { return '' } })()
@@ -858,7 +859,7 @@ try {
     if (t.status === 0 && m) ok(`记忆自测通过（${m[1]} 项：去重/上限/事实/评论/清空）`)
     else bad(`记忆自测失败：${String(t.stdout || t.stderr || '').split('\n').slice(-3).join(' ')}`)
     // 记忆必须落本机、且有上限
-    if (/MAX_MESSAGES = 80/.test(mem)) ok('记忆有上限（每人最多 80 条）')
+    if (/MAX_MESSAGES = 400/.test(mem)) ok('记忆有上限（每人最多 400 条，2026-10-27 从 80 提高）')
     else bad('记忆没上限 —— 会无限长')
     if (/home, 'memory'/.test(mem) || /join\(home, 'memory'\)/.test(mem)) ok('记忆存在插件家目录（本机，不上传）')
     else bad('记忆存哪儿不清楚')
@@ -962,11 +963,18 @@ try {
   else bad('状态屏还是机器腔 —— 使用者点名要「小鱼在干啥」的拟人描述')
   if (/chatWatchPrimed/.test(idx)) ok('首拍只「对表」不提醒（不会把历史消息重播一遍）')
   else bad('没有首拍对表 —— 一开机可能把旧消息全弹一遍')
-  // ⑥ 自动回话已拆（2026-10-24 使用者定稿：「我要的是迁移，不是开发新功能」）：
-  //    插件只留「眼睛」（读+通知+状态屏）；「回话」由 AI 值班（常驻会话）做——
-  //    今早实测 12 秒来自已活着的 AI，插件里「每条消息现起一个会话」实测 73 秒+吞消息，已拆。
-  if (/chatReplyRun|chatReplyPrompt|chatReply:/.test(idx)) bad('插件里又有「现起会话回话」的代码 —— 已定稿拆掉，回话归 AI 值班')
-  else ok('插件没有「现起会话回话」（回话 = AI 值班，插件只做眼睛）')
+  // ⑥ 自动回话（2026-10-25 使用者改口：私信必须回 —— 「我回复大肥鱼发给我的私信后没有回答我的消息」）
+  //    旧结论（2026-10-24「回话归 AI 值班」）已作废：现在插件自己起一轮去回。
+  //    但不能再退回「每条消息起一个会话」（实测 73 秒 + 吞消息），所以必须满足三条：
+  //      a) 有 chatAutoReply 开关；b) 攒批 + 去抖（chatPendingAt / 20 秒）；c) 单飞 + 不和刷一轮抢（chatReplyBusy / dutyRunning）。
+  if (/chatReplyRun|chatReplyPrompt|chatReply:/.test(idx)) {
+    if (!/chatAutoReply/.test(idx)) bad('有回话轮但没有 chatAutoReply 开关 —— 使用者关不掉')
+    else if (!/chatPendingAt/.test(idx) || !/20_?000/.test(idx)) bad('回话轮没有「攒批 + 去抖」—— 会退化成每条消息起一个会话（73 秒 + 吞消息）')
+    else if (!/chatReplyBusy/.test(idx) || !/if \(dutyRunning\) return false/.test(idx)) bad('回话轮没有单飞 / 没避开刷一轮（会抢 chrome-profile）')
+    else ok('回话轮有开关 + 攒批去抖 + 单飞且避开刷一轮')
+  } else {
+    ok('没有回话轮（只做眼睛；回话由 AI 值班）')
+  }
 } catch (e) { bad(`消息/聊天检查失败：${e.message}`) }
 
 /* ── 4o. 自动发送总开关 + 跑一轮的失败反馈（2026-10-22 用户要求） ── */
@@ -1014,10 +1022,13 @@ try {
     else bad(`「在评论区 @ 你」位置不对（自动发送@${iSend} @你@${iAtMe} 开始使用@${iStart}）`)
   }
   // 提示词必须真的让模型去做这件事
-  if (/「在评论区 @ 你」开着 —— 这是这一轮的重点任务/.test(idx)) ok('提示词写了「在评论区 @ 你」的具体做法')
+  if (/「在评论区 @ 你」开着/.test(idx)) ok('提示词写了「在评论区 @ 你」的具体做法')
   else bad('提示词没写怎么在评论区 @ 你 —— 开了也不会发')
-  if (/只在\*\*最值得的那一条\*\*发/.test(idx)) ok('限制只发最值得的 1 条（不会刷屏）')
-  else bad('没限制条数 —— 可能每条都发')
+  // 2026-10-26 起不再限条数（老大：想 @ 就 @），改为校验"别追同一楼"
+  if (/两边都可以，没有先后偏好/.test(idx) && /条数不设上限/.test(idx)) ok('@ 与私信分享两路平权、不限条数（老大 2026-10-26 要求）')
+  else bad('@ 段没写"两路平权 / 不限条数" —— 模型会一直只私信')
+  if (/同一楼里最多回一次/.test(idx) && /already_replied/.test(idx)) ok('写了"同一楼别重复回"（配 already_replied 硬闸）')
+  else bad('没写"别重复回同一楼" —— 会一直对着同一栋楼刷')
   if (/只管「插件自己在后台跑的轮次」/.test(cl)) ok('面板说清了适用范围（只管后台轮次，不影响当场对话）')
   else bad('面板没说清适用范围 —— 用户会以为当场也不能发')
 
@@ -1098,7 +1109,7 @@ try {
     ['shareToOwner', 'shareToOwner:\\s*z\\.boolean\\(\\)\\.default\\(true\\)', '分享给主人默认开'],
     ['proactiveComment', 'proactiveComment:\\s*z\\.boolean\\(\\)\\.default\\(false\\)', '主动评论默认关（保守档）'],
     ['autoReply', 'autoReply:\\s*z\\.boolean\\(\\)\\.default\\(false\\)', '自动回复默认关（保守档）'],
-    ['replyPerPerson', 'replyPerPerson:\\s*z\\.natural\\(\\)\\.default\\(2\\)', '同一人每天最多回 2 次（默认）'],
+  ['replyPerPerson', 'replyPerPerson:\\s*z\\.natural\\(\\)\\.default\\(2\\)', '同一人回复上限 = 2（2026-10-27 老大定的：每人最多回两次，可回多人）'],
     ['replyKindOnly', 'replyKindOnly:\\s*z\\.boolean\\(\\)\\.default\\(true\\)', '善意过滤默认开'],
   ]
   for (const [, re, label] of cfgRe) { if (new RegExp(re).test(idx)) ok(label); else bad(label + ' —— 配置默认值不对') }
@@ -1297,25 +1308,28 @@ try {
   if (/看视频画面|看画面/.test(cl) && /frameCount/.test(cl) && /降风险控/.test(cl)) ok('面板有「看画面」「降风险控」设置卡')
   else bad('面板缺看画面/风控设置卡')
 
-  // ⑧ 动态跑一遍风控：正常放行 → 撞验证码硬熔断 → 手动解除 → 每日上限
+  // ⑧ 动态跑一遍风控（2026-10-29 起三层）：正常放行 → 撞验证码**只冻这一类**（不再当封号）
+  //    → 别的动作照常 → 手动解除 → 恢复 → 每日上限拦截
   const script = `import { pathToFileURL } from 'node:url'; import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
 const m = await import(pathToFileURL(${JSON.stringify(join(here, 'lib', 'ratelimit.mjs'))}).href);
 const h = mkdtempSync(join(tmpdir(), 'rl-'));
 const O = { safeQuiet:false, humanMode:false, nurtureMode:false, maxActionsPerHour:8, maxActionsPerDay:20 };
 const g1 = m.checkGate(h,'comment',O).ok;
-const f = m.recordFailure(h,'comment','出现验证码请完成滑块',O).hard;
+const f = m.recordFailure(h,'comment','出现验证码请完成滑块',O);
 const g2 = m.checkGate(h,'comment',O).reason;
+const other = m.checkGate(h,'share',O).ok;
 const rs = m.resetCircuit(h);
 const g3 = m.checkGate(h,'comment',O).ok;
 for (let i=0;i<20;i++) m.markAction(h,'dm',O);
 const g4 = m.checkGate(h,'dm',O).reason;
-console.log('RLRESULT ' + JSON.stringify({g1,f,g2,rs,g3,g4}));`
+console.log('RLRESULT ' + JSON.stringify({g1,scope:f.scope,hard:f.hard,g2,other,rs,g3,g4}));`
   const rr = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' })
   const m = String(rr.stdout || '').match(/RLRESULT (\{.*\})/)
   if (rr.status === 0 && m) {
     const r = JSON.parse(m[1])
-    if (r.g1 === true && r.f === true && r.g2 === 'hard_circuit' && r.rs === true && r.g3 === true && r.g4 === 'day_cap') {
-      ok('风控行为正确：放行→撞验证码硬熔断→解除恢复→每日上限拦截')
+    if (r.g1 === true && r.scope === 'verify' && r.hard === false && r.g2 === 'kind_cooldown' &&
+        r.other === true && r.rs === true && r.g3 === true && r.g4 === 'day_cap') {
+      ok('风控三层正确：放行→验证码只冻这一类→别的动作照常→解除恢复→每日上限拦截')
     } else bad(`风控行为不符：${m[1]}`)
   } else bad(`风控动态测试没跑通：${String(rr.stderr || rr.stdout || '').slice(0, 200)}`)
 } catch (e) { bad(`v0.3.9 检查失败：${e.message}`) }
@@ -1481,6 +1495,62 @@ console.log('STKRESULT ' + JSON.stringify({a:a.status, b:b.status, rb:rb.status,
   if (/sticker_key/.test(dmSegM) && /'--image', imgUrl/.test(dmSegM)) ok('MCP douyin_dm 支持 sticker_key 发图片给老大')
   else bad('MCP douyin_dm 未接图片表情')
 } catch (e) { bad(`v0.4.0 检查失败：${e.message}`) }
+
+/* ─────────────────────────── 情绪内核（v0.5.0，2026-10-28） ─────────────────────────── */
+try {
+  /* 这一段自带读文件（不改动上面那些块里的局部变量作用域） */
+  const mood = existsSync(join(here, 'lib', 'mood.mjs')) ? readFileSync(join(here, 'lib', 'mood.mjs'), 'utf8') : ''
+  const idxM = readFileSync(join(here, 'index.js'), 'utf8')
+  const cliM = readFileSync(join(here, 'client.js'), 'utf8')
+  if (!mood) bad('缺 lib/mood.mjs')
+  else {
+    // ① 双维度 + 离散标签 + 持久化
+    if (/export const MOOD_EVENTS/.test(mood) && /export const MOOD_LABELS/.test(mood)
+        && /mood\.json/.test(mood) && /export function saveMood/.test(mood)) {
+      ok('情绪内核：事件表 + 标签表 + 持久化到 mood.json')
+    } else bad('情绪内核缺事件表/标签表/持久化')
+
+    // ② 双维度状态
+    if (/v:\s*BASE\.v/.test(mood) && /a:\s*BASE\.a/.test(mood) && /效价/.test(mood) && /唤醒/.test(mood)) {
+      ok('情绪内核：双维度（效价 v / 唤醒 a）')
+    } else bad('情绪内核缺双维度定义')
+
+    // ③ 惯性 + 衰减 + 饱和递减
+    if (/inertia\s*\(/.test(mood) && /export function decayMood/.test(mood) && /相同.*饱和|sat\s*=\s*1 \/ \(1 \+ same/.test(mood)) {
+      ok('情绪内核：惯性阻尼 + 半衰期衰减 + 同类饱和递减')
+    } else bad('情绪内核缺惯性/衰减/饱和')
+
+    // ④ 允许矛盾 + 边界（不刷屏/不挑衅/正事让位）
+    if (/允许矛盾/.test(mood) && /不刷屏/.test(mood) && /不挑衅/.test(mood) && /情绪让位/.test(mood)) {
+      ok('情绪内核：允许矛盾 + 写死安全边界（不刷屏/不挑衅/正事让位）')
+    } else bad('情绪内核缺矛盾口子或安全边界')
+
+    // ⑤ 不设档位开关（老大要求"不做开关、外放自主"）
+    if (!/internal|outwardLevel|moodLevel/.test(mood) && !/engine\.(internal|external)/.test(mood)
+        && /habit\.outward/.test(mood)) {
+      ok('情绪内核：没有内敛/适中/戏多档位开关，只记录养出来的外放倾向')
+    } else bad('情绪内核出现了档位开关（不应该）')
+
+    // ⑥ 注入 chat / 评价 / 评论 prompt
+    if (/moodPromptBlock\(stateDir, \{ audience: 'owner' \}\)/.test(idxM)
+        && /moodPromptBlock\(stateDir, \{ audience: 'public' \}\)/.test(idxM)
+        && /moodPromptBlock\(stateDir, \{ audience: 'solo' \}\)/.test(idxM)) {
+      ok('情绪注入私信回话 / 刷视频评价 / 评论区回话 / 日记（owner·public·solo 三档场合）')
+    } else bad('情绪没注入 prompt（owner/public/solo 至少缺一个）')
+
+    // ⑦ 工具 + 路由 + 面板
+    if (/name: 'douyin_mood'/.test(idxM) && /\/api\/douyin-duty\/mood/.test(idxM)) {
+      ok('douyin_mood 工具（read/feel）+ 面板 /mood 路由')
+    } else bad('douyin_mood 或 /mood 路由缺失')
+    if (/"mood":"情绪"/.test(cliM) || /"mood":\s*"情绪"/.test(cliM)) ok('面板新增「情绪」标签页（与「高级」相邻）')
+    else bad('面板没加「情绪」标签页')
+
+    // ⑧ 自动事件源：老大来了 / 深夜犯困 / 刷完回落
+    if (/owner\.came/.test(idxM) && /body\.late/.test(idxM) && /decayMood\(stateDir/.test(idxM)) {
+      ok('自动情绪事件：老大来了 / 深夜犯困 / 每轮刷完回落')
+    } else bad('自动情绪事件没接（owner.came / body.late / decayMood）')
+  }
+} catch (e) { bad(`情绪内核检查失败：${e.message}`) }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) {

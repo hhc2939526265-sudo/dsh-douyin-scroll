@@ -17,6 +17,7 @@
  *   node tools/card-share.mjs <aweme_id> <好友昵称> --dry    # 只展开面板打印结构
  */
 import { openPage, sleep } from '../lib/chrome.mjs'
+import { channelsOf, markChannel } from '../lib/channels.mjs'
 
 const argv = process.argv.slice(2)
 const argOf = (k, d = '') => { const i = argv.indexOf(k); return i >= 0 ? (argv[i + 1] ?? d) : d }
@@ -31,6 +32,24 @@ const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode =
 
 if (!AID || !WHO) { out({ ok: false, error: '用法: card-share.mjs <aweme_id> <好友昵称>' }); process.exit(1) }
 
+/**
+ * ⭐ 2026-10-27 老大要求：**@ 过的视频，私信就不用再分享了**。
+ *    同一条视频先在评论区 @ 过他，再私信推一遍，等于两条通知砸过去 —— 很烦。
+ *    要覆盖就设 DOUYIN_FORCE_CHANNEL=1（面板的 force:true 会传）。
+ */
+if (!DRY && !PEEK && process.env.DOUYIN_FORCE_CHANNEL !== '1') {
+  const ch = channelsOf(AID)
+  if (ch.mention) {
+    out({
+      ok: false, blocked: 'already_mentioned', aweme_id: AID,
+      mentioned_at: ch.mention,
+      error: '这条已经在评论区 @ 过老大了 —— 同一条别再私信推一遍（会连发两条通知）',
+      hint: '换一条没推过的；确实要再推就设 DOUYIN_FORCE_CHANNEL=1。',
+    })
+    process.exit(1)
+  }
+}
+
 const _c = await openPage()
 const chromed = _c.status
 const { send, ev } = _c
@@ -43,15 +62,41 @@ const click = async (x, y) => {
 
 try {
   await send('Page.navigate', { url: `https://www.douyin.com/video/${AID}` })
-  await sleep(7000)
 
-  const pos = JSON.parse(await ev(`(function(){
-    var ic=document.querySelector('[data-e2e="video-share-icon-container"]');
-    if(!ic) return '{}';
-    var r=ic.getBoundingClientRect();
-    return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});
-  })()`))
-  if (!pos.x) { out({ ok: false, error: '找不到分享图标（视频页没加载好）' }); process.exit(1) }
+  // ⭐ 2026-10-29：**轮询等页面真的起来**再找图标。
+  //    之前固定 sleep 7 秒 —— 可视频页常先显示「验证码中间页」再自己恢复（实测 20 秒后才正常），
+  //    于是永远找不到分享图标，被误报成"DOM 改版/没加载好"（这轮两次分享失败就是这么来的）。
+  let pos = {}
+  let gateTitle = ''
+  for (let i = 0; i < 24; i++) {
+    await sleep(1500)
+    const st = JSON.parse(await ev(`(function(){
+      var ic = document.querySelector('[data-e2e="video-share-icon-container"]');
+      var r = ic ? ic.getBoundingClientRect() : null;
+      return JSON.stringify({
+        title: document.title || '',
+        x: r ? Math.round(r.x + r.width / 2) : 0,
+        y: r ? Math.round(r.y + r.height / 2) : 0,
+      });
+    })()`))
+    gateTitle = String(st.title || '')
+    if (st.x) { pos = st; break }
+  }
+  if (!pos.x) {
+    const captcha = /验证码中间页|安全验证|请完成验证/.test(gateTitle)
+    out({
+      ok: false,
+      blocked: captcha ? 'captcha_interstitial' : 'share_icon_missing',
+      aweme_id: AID,
+      error: captcha
+        ? '抖音把浏览器拦在「验证码中间页」上了 —— 这一页根本没有分享图标，不是脚本坏了'
+        : `等了 36 秒也没等到分享图标（页面标题：${gateTitle || '空'}）`,
+      hint: captcha
+        ? '开一次可见浏览器手动过验证：node tools/qr-login.mjs start → 过完 → node tools/qr-login.mjs close；别在这轮反复重试'
+        : '先别重试同一条：换一条视频试，或者这轮先只发评论/私信',
+    })
+    process.exit(1)
+  }
 
   // 真实轨迹 hover（必须；el.click() 打不开）
   await mv(20, 20); await sleep(250)
@@ -182,6 +227,8 @@ try {
       toast: (document.body.innerText||'').indexOf('已发送')>=0 || (document.body.innerText||'').indexOf('发送成功')>=0
     });
   })()`)
+  /* ⭐ 记一笔：这条走的是私信渠道（下次私信推它会被拦、评论区 @ 只给提示） */
+  try { markChannel(AID, 'dm') } catch { /* 记不上不影响发 */ }
   out({ ok: true, sent: true, aweme_id: AID, to: WHO, panel, btn: b, chrome: chromed, after: JSON.parse(after) })
 } catch (e) {
   out({ ok: false, error: String(e?.message ?? e) })

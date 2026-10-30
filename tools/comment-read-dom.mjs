@@ -59,6 +59,34 @@ async function main() {
     await send('Page.navigate', { url: `https://www.douyin.com/video/${AWEME}` })
     await sleep(6500)
 
+    /**
+     * ⭐ 2026-10-25 加：顺手把「这条视频是什么」带出去 —— 老大在评论区 @ 你、
+     *    问的问题又跟视频有关时，必须先知道视频在讲什么才回得对（需求④）。
+     *    抓不到就给空串，绝不编。
+     */
+    let video = { desc: '', author: '', tags: [] }
+    try {
+      const vraw = await ev(`(function(){
+        function txt(sels){
+          for (var i=0;i<sels.length;i++){
+            var e=document.querySelector(sels[i]);
+            if(e){ var t=(e.innerText||'').trim(); if(t) return t }
+          }
+          return '';
+        }
+        var desc = txt(['[data-e2e="video-desc"]','[data-e2e="browse-video-desc"]','[data-e2e="detail-video-desc"]','[data-e2e="video-info"] h1','.video-info-detail h1']);
+        var title = (document.title||'').replace(/\\s*-\\s*抖音\\s*$/,'').trim();
+        if (!desc) desc = title;   // 兜底：标题里常常就是文案 + 话题
+        var author = txt(['[data-e2e="video-author-name"]','[data-e2e="user-name"]','[data-e2e="video-author"] a']);
+        // 侧边栏的「我的/推荐/关注…」不是作者 —— 宁可为空也别给错人
+        if (/^(我的|推荐|关注|朋友|精选|AI抖音|直播|放映厅|短剧|小游戏)$/.test(author)) author = '';
+        var tags = ((desc || '') + ' ' + ((document.title||''))).match(/#[^\\s#]{1,20}/g) || [];
+        tags = tags.filter(function(t,i){ return tags.indexOf(t) === i }).slice(0,8);
+        return JSON.stringify({ desc: desc.slice(0,400), author: author.slice(0,40), tags: tags, title: (document.title||'').slice(0,120) });
+      })()`)
+      video = JSON.parse(vraw) || video
+    } catch { /* 抓不到就空着，不影响读评论 */ }
+
     // 点开评论面板（右侧栏那个「评论」）
     await ev(`(function(){
       var c=document.querySelector('[data-e2e="feed-comment-icon"]')||document.querySelector('[data-e2e="comment-icon"]');
@@ -131,6 +159,7 @@ async function main() {
       ok: true,
       aweme_id: AWEME,
       chrome: chromed,
+      video,
       me_nick: ME || '(不知道 —— 先扫码登录，或设 DOUYIN_ME_NICK)',
       total_scraped: items.length,
       mine_n: items.filter((o) => o.mine).length,

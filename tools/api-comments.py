@@ -17,8 +17,25 @@ import urllib.parse
 import httpx
 
 HOME = home_str()
-PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
-NODE = r"C:\Program Files\nodejs\node.exe"
+PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _find_node():
+    """本机 node 不一定在 PATH，也不一定是 C:\\Program Files\\nodejs（DSH 自带一份）→ 逐个找。"""
+    import glob
+    import shutil
+    cands = [os.environ.get("DOUYIN_NODE") or "", os.environ.get("NODE_BIN") or "",
+             shutil.which("node") or "",
+             os.path.join(os.path.dirname(sys.executable), "node.exe"),
+             r"C:\Program Files\nodejs\node.exe"]
+    cands += sorted(glob.glob(os.path.expanduser(r"~\.dsh\dsh-runtimes\*\dependencies\node\bin\node.exe")))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return "node"
+
+
+NODE = _find_node()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -93,8 +110,124 @@ def extract_sticker(c):
     return None
 
 
+def _pagefetch_comments(aweme, pages=2):
+    """
+    ⭐ 2026-10-29：**页面上下文读评论**（不依赖外部签名器）。
+    签名器坏了（signedUrl 缺失）之后，兜底一直是「打开视频页滚屏抓 DOM」，可抖音现在
+    会给自动化浏览器弹「验证码中间页」⇒ DOM 抓 0 条、还看不出原因。
+    这里改用 tools/comment-read-api.mjs（页面同源 fetch），并把「被验证码拦住」如实报上来。
+    返回 (items, why)；why='captcha_interstitial' 表示被拦。
+    """
+    script = os.path.join(PLUGIN, "tools", "comment-read-api.mjs")
+    if not os.path.isfile(script):
+        return [], ""
+    try:
+        r = subprocess.run([NODE, script, "--aweme", str(aweme), "--pages", str(pages), "--limit", "60"],
+                           capture_output=True, timeout=260,
+                           env={**os.environ, "DOUYIN_HOME": HOME})
+        out = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("page-fetch 读评论失败：%s\n" % e)
+        return [], ""
+    i, j = out.find("{"), out.rfind("}")
+    if i < 0 or j <= i:
+        return [], ""
+    try:
+        data = json.loads(out[i:j + 1])
+    except Exception:  # noqa: BLE001
+        return [], ""
+    if isinstance(data, dict) and data.get("reason") == "captcha_interstitial":
+        return [], "captcha_interstitial"
+    items = data.get("items") if isinstance(data, dict) else None
+    return [x for x in (items or []) if isinstance(x, dict) and (x.get("text") or x.get("nick"))], ""
+
+
+def _dom_comments(aweme, scroll=4):
+    """读评论的兜底链：① 页面上下文 fetch（最快、不依赖签名器）② 滚屏抓 DOM。
+    返回 (items, video)。items=[{"nick":..., "text":...}]；video 里出现 "__captcha__": True 表示被验证码拦住。"""
+    pf, why = _pagefetch_comments(aweme, pages=2)
+    if pf:
+        return pf, {}
+    if why == "captcha_interstitial":
+        # 被验证码拦在中间页：别再滚屏白跑（只会得到 0 条，还让人误以为"没人评论"）
+        return [], {"__captcha__": True}
+    script = os.path.join(PLUGIN, "tools", "comment-read-dom.mjs")
+    if not os.path.isfile(script):
+        return [], {}
+    try:
+        r = subprocess.run([NODE, script, "--aweme", str(aweme), "--scroll", str(scroll)],
+                           capture_output=True, timeout=260,
+                           env={**os.environ, "DOUYIN_HOME": HOME})
+        out = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("dom 读评论失败：%s\n" % e)
+        return [], {}
+    i, j = out.find("{"), out.rfind("}")
+    if i < 0 or j <= i:
+        return [], {}
+    try:
+        data = json.loads(out[i:j + 1])
+    except Exception:  # noqa: BLE001
+        return [], {}
+    items = data.get("items") if isinstance(data, dict) else None
+    video = data.get("video") if isinstance(data, dict) else None
+    return [x for x in (items or []) if isinstance(x, dict) and (x.get("text") or x.get("nick"))], (video or {})
+
+
+def _dom_main(aweme):
+    """把 DOM 读到的评论打成 host 认识的格式（以 `  cid=N` 开头的行），并回退成功。"""
+    import re as _re
+    items, video = _dom_comments(aweme)
+    clean = []
+    for x in items:
+        nick = str(x.get("nick") or "").strip()
+        txt = _re.sub(r"^\.\.\.\s*", "", str(x.get("text") or "")).strip()
+        if not txt or _re.match(r"^(精选|搜索|充钻石|推荐|登录)\s*$", nick):
+            continue
+        if "视频数据加载中" in txt:
+            continue
+        # ⭐ 2026-10-29：page-fetch 拿到的是**真 cid**，别再自己编号 ——
+        #    回复/删除/@ 都要用真 cid；只有滚屏 DOM 那条路才没有 cid。
+        clean.append((str(x.get("cid") or ""), nick, txt, int(x.get("digg") or 0)))
+    if not clean:
+        if isinstance(video, dict) and video.get("__captcha__"):
+            print(json.dumps({
+                "ok": False, "reason": "captcha_interstitial",
+                "err": "抖音把浏览器拦在「验证码中间页」上，读不到这条视频的评论",
+                "hint": "让老大在设置页点「打开浏览器」手动过一次滑块/验证码（或者用 tools/comment-verify.mjs），之后就能读了",
+            }, ensure_ascii=False))
+            return 1
+        print(json.dumps({"ok": False, "err": "签名接口与 DOM 兜底都没读到评论"}, ensure_ascii=False))
+        return 1
+    real_cids = sum(1 for c in clean if c[0].isdigit() and len(c[0]) > 10)
+    print("page=0 status_code=0 comments=%d 新=%d has_more=False  源=%s" % (
+        len(clean), len(clean), "page-fetch" if real_cids else "dom"))
+    for n, (cid, nick, txt, digg) in enumerate(clean, start=1):
+        print("  cid=%s  %s  [%s]  赞%s  %s" % (cid or n, nick, txt[:100], digg, "page-fetch" if cid else "dom"))
+    print("合计 %d 条（兜底链：page-fetch%s）" % (len(clean), "" if real_cids else " → 滚屏 DOM"))
+    # ⭐ 2026-10-25：把「这条视频是什么」一起带给 host —— 老大在评论区 @ 你、
+    #    问的又跟视频有关时，回话前必须先知道视频在讲什么。
+    print("VIDEO_JSON=" + json.dumps({
+        "desc": str((video or {}).get("desc") or "")[:400],
+        "author": str((video or {}).get("author") or "")[:60],
+        "tags": list((video or {}).get("tags") or [])[:8],
+        "title": str((video or {}).get("title") or "")[:120],
+    }, ensure_ascii=False))
+    print("STICKERS_JSON=[]")
+    return 0
+
+
 def main():
     aweme = sys.argv[1] if len(sys.argv) > 1 else "7698980229549139835"
+    try:
+        return _api_main(aweme)
+    except Exception as e:  # noqa: BLE001
+        # 常见原因：$DOUYIN_HOME/signer 下缺 sdk 资产 / jsdom ⇒ KeyError: 'signedUrl'
+        sys.stderr.write("签名接口失败（%s），改走 DOM 兜底\n" % e)
+        return _dom_main(aweme)
+
+
+def _api_main(aweme):
     seen = set()
     total = 0
     stickers = {}   # key -> 贴纸记录（去重）；供大肥鱼表情包库收集
@@ -102,8 +235,7 @@ def main():
         rel = "/aweme/v1/web/comment/list/?" + qs({**COMMON, "aweme_id": aweme, "count": 20, "cursor": page * 20, "item_type": 0})
         s = sign(rel)
         if s.get("err"):
-            print(json.dumps({"ok": False, "err": s["err"]}, ensure_ascii=False))
-            return 1
+            raise RuntimeError(s["err"])
         u = s["signedUrl"]
         if not u.startswith("http"):
             u = "https://www.douyin.com" + u

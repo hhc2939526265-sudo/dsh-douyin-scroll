@@ -81,6 +81,12 @@ node "<插件目录>/tools/mcp-server.mjs"
 |---|---|
 | `douyin_sticker_review` | 🔴 **表情安全审核**：先 Read 贴纸 `thumb` 亲眼看，再 `decision:"approved"/"blocked"` + 标签。只放行可爱/萌/抽象/搞笑/大肥鱼/治愈/萌宠；色情/暴力/血腥/恐怖/恶心/违法/涉政/辱骂/未成年向一律 block |
 
+### 情绪（看 / 记一笔，v0.5.0）
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `douyin_mood` | `action: "read" \| "feel"`、`kind`、`note`、`strength` | `read` 看现在什么心情、今天整体、最近轨迹；`feel` 记一笔「刚发生了什么」（如 `video.funny` / `video.cute` / `comment.kind` / `owner.came`），心情会跟着变。⭐ 不记也不会错 —— 心情不是任务。 |
+
 ### 会发东西（**必须 `confirm: true`**）
 
 | 工具 | 干什么 |

@@ -136,7 +136,7 @@ async function main() {
     // 等评论框出现
     let hasBox = false
     for (let i = 0; i < 12; i++) {
-      hasBox = Boolean(await c.ev(commentInputExpr)).catch(() => false)
+      hasBox = await c.ev(commentInputExpr).then(Boolean).catch(() => false)
       if (hasBox) break
       await sleep(800)
     }

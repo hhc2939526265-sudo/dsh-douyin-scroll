@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * tools/mcp-server.mjs —— 把「刷抖音」这套能力开放成 **标准 MCP server**（stdio）
- * ============================================================================
+ * tools/mcp-server.mjs —— 把「刷抖音」的能力通过 MCP 暴露出去，别的 agent 工具也能直接用。
+ *
  * 为什么要有它：
  *   插件本体是 DSH 的 bundle —— 只有在 DSH 里才看得见 `douyin_*` 工具。
  *   但使用者可能还想让**别的 agent 工具**（Claude Code / Codex / Cursor / Cline /
@@ -41,12 +41,16 @@ import {
 } from '../lib/engage.mjs'
 // ⭐ v0.3.9 降风险控（与 host 共用同一份，值班轮走 MCP 也绕不过）
 import {
-  awaitGate, markAction, recordFailure,
+  awaitGate, markAction, recordFailure, loadRateState, nurtureQuota,
 } from '../lib/ratelimit.mjs'
 // ⭐ v0.4.0 表情包库：收集 + 安全审核 + 只发 approved + 每日贴纸额度（与 host 共用同一份）
 import {
   ingestStickers, listStickers, reviewSticker, stickerStats, stickerSentToday, markStickerSent,
 } from '../lib/stickers.mjs'
+// ⭐ v0.5.0 情绪内核：自己的心情（事件驱动、有惯性与衰减），只影响口气不影响该做的事
+import {
+  ensureMood, moodGet, moodFeel, decayMood, moodPromptBlock, MOOD_EVENTS,
+} from '../lib/mood.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -121,18 +125,52 @@ const dayKey = (d = new Date()) => {
 
 const config = () => readJson(join(HOME, 'config.json'), {}) || {}
 
+/**
+ * ⭐ 发出去之前的最后一道整理（2026-10-25 老大改了口径）。
+ *    以前是把「老大，」硬钉在开头 —— 老大说太机械，要求**称呼按内容自然放置**。
+ *    所以这里只做清理，**不再补前缀**；称呼由模型按上下文自己安排（prompt 里已交代）。
+ *    与 host index.js 的 withTitle 同一套规则（MCP 是值班轮的主路径，两边必须一致）。
+ */
+const withTitle = (s, c) => {
+  const name = String((c && c.ownerTitle) ?? '老大').trim()
+  let body = String(s || '').trim().replace(/\s*——\s*/g, '，').replace(/\s*--+\s*/g, '，').replace(/，{2,}/g, '，')
+  if (!body) return body
+  if (name) {
+    // 只收拾「连写两遍称呼」这种手滑，不动位置
+    const dup = new RegExp(`^${name}[，,、\\s]+${name}[，,、\\s]*`)
+    body = body.replace(dup, `${name}，`)
+  }
+  return body
+}
+
 /* ⭐⭐ v0.3.9 风控 + 私信铁闸（与 host index.js 同一套规则） ===================== */
+/**
+ * ⭐ 2026-10-25 老大改的口径（与 host index.js 的 capAfterNurture 一致）：
+ *    默认 100/260，只在**养号前 3 天**真的生效；出了养号期还是默认值 ⇒ 传 0 = 不限。
+ *    使用者手动把数字改掉了 ⇒ 那就按他改的继续卡（尊重他显式设置的值）。
+ */
+const lateCaps = (c) => {
+  const H = 100, D = 260
+  let nurturing = true
+  try { nurturing = nurtureQuota(loadRateState(HOME), { nurtureMode: c.nurtureMode !== false, nurtureDays: Number(c.nurtureDays) || 3 }) < 1 } catch { nurturing = true }
+  const h = Number(c.maxActionsPerHour) || H
+  const d = Number(c.maxActionsPerDay) || D
+  if (!nurturing) return { h: h === H ? 0 : h, d: d === D ? 0 : d }
+  return { h, d }
+}
+
 const rateOpts = () => {
   const c = config()
   return {
     humanMode: c.humanMode !== false,
     safeQuiet: c.safeQuiet !== false,
-    quietStart: String(c.quietStart || '23:00'),
+    quietStart: String(c.quietStart || '23:55'),
     quietEnd: String(c.quietEnd || '08:00'),
-    maxActionsPerHour: Number(c.maxActionsPerHour) || 8,
-    maxActionsPerDay: Number(c.maxActionsPerDay) || 20,
+    // ⭐ 2026-10-25：默认 100/260；**只有养号前 3 天真的卡**，之后不限额（手动改过数字才继续卡）
+    maxActionsPerHour: lateCaps(c).h,
+    maxActionsPerDay: lateCaps(c).d,
     nurtureMode: c.nurtureMode !== false,
-    nurtureDays: Number(c.nurtureDays) || 7,
+    nurtureDays: Number(c.nurtureDays) || 3,
   }
 }
 const RATE_NOTE = {
@@ -375,7 +413,7 @@ const TOOLS = [
       if (!to && !toId) return { ok: false, error: '不知道发给谁', hint: '传 to / to_id，或让使用者在设置里填「私信发给谁」+「稳定 ID」' }
       const ob = ownerOnlyGate(cfg, toId)
       if (ob) return ob
-      const reasonText = String(args?.reason || '').trim()
+      const reasonText = withTitle(String(args?.reason || '').trim(), cfg)
       let ids = []
       if (args?.aweme_id) ids = [String(args.aweme_id).trim()]
       else {
@@ -395,13 +433,17 @@ const TOOLS = [
           note: '没发送 —— 先把预览给使用者看，他点头后再用 confirm:true 调一次',
         }
       }
-      /* 大肥鱼每日分享上限（硬规则，只对真发送生效）：额度用完就不发 */
-      const shareCap = canShare(HOME, Number(cfg.sharePerDay ?? 5))
-      if (!shareCap.ok) {
-        noteSkipped(HOME, 'share_cap')
-        return { ok: false, blocked: 'share_cap', error: `今天给老大分享卡片已到上限（${shareCap.used}/${shareCap.max} 条）—— 好东西也别刷屏，明天再继续` }
+      /* 大肥鱼每日分享上限 —— ⚠️ 2026-10-25 起**默认不限**：发几条由它自己判断；
+         只有把 sharePerDay 显式设成 > 0 时这个旧上限才生效 */
+      const shareCapMax = Number(cfg.sharePerDay ?? 0)
+      if (shareCapMax > 0) {
+        const shareCap = canShare(HOME, shareCapMax)
+        if (!shareCap.ok) {
+          noteSkipped(HOME, 'share_cap')
+          return { ok: false, blocked: 'share_cap', error: `今天给老大分享卡片已到上限（${shareCap.used}/${shareCap.max} 条）—— 好东西也别刷屏，明天再继续` }
+        }
+        if (ids.length > shareCap.left) ids = ids.slice(0, shareCap.left)
       }
-      if (ids.length > shareCap.left) ids = ids.slice(0, shareCap.left)
       // ⭐ 需求⑥：分享必须带一句自己的看法
       if (!reasonText) {
         return {
@@ -411,7 +453,8 @@ const TOOLS = [
         }
       }
       // ⭐ 风控闸（v0.3.9）
-      const gate = await awaitGate(HOME, 'share', rateOpts())
+      // ⭐ 私信分享额度与评论区 @ 老大**分开记**（kindDayCap；0 = 不限），互不挤占
+      const gate = await awaitGate(HOME, 'share', { ...rateOpts(), kindDayCap: Number(config().shareDmPerDay) || 0 })
       if (!gate.ok) return rateBlocked(gate)
       const sent = []
       for (let i = 0; i < ids.length; i++) {
@@ -459,7 +502,7 @@ const TOOLS = [
       properties: {
         to: { type: 'string', description: '好友昵称（只用于显示）；留空用配置 dmTo' },
         to_id: { type: 'string', description: '好友稳定 id（sec_uid）；留空用配置 dmToId' },
-        text: { type: 'string', description: '私信正文（与 sticker_key 二选一）' },
+        text: { type: 'string', description: '私信正文（与 sticker_key 二选一）。⭐ 想连发几条就**用换行分段**，工具会一条条发出去（像真人连发）；不必每句都带称呼，一段里出现一次即可，位置随内容自然安排' },
         sticker_key: { type: 'string', description: '给老大发一张图片表情：表情库 key（必须已审核 approved），走聊天框图片上传，受每日贴纸上限' },
         dry: { type: 'boolean', description: '只验证通道，不真发' },
         confirm: { type: 'boolean', description: '🔴 必须由使用者当场同意后传 true，否则只回草稿' },
@@ -476,7 +519,7 @@ const TOOLS = [
       // ⭐ 私信铁闸（v0.3.9）：只发给老大
       const ob = ownerOnlyGate(cfg, toId)
       if (ob) return ob
-      const text = String(args?.text || '').trim()
+      const text = withTitle(String(args?.text || '').trim(), cfg)
       // ⭐ 图片表情（sticker_key）：只发给老大
       const skey = String(args?.sticker_key || '').trim()
       if (skey) {
@@ -488,10 +531,10 @@ const TOOLS = [
         }
         const imgUrl = String(st.url || st.thumb || '').trim()
         if (!imgUrl) return { ok: false, unsupported: 'no_image_url', error: '这张表情没有可上传的图片地址' }
-        const perDay = Math.max(0, Number(cfg.stickerPerDay ?? 5) || 0)
+        const perDay = Math.max(0, Number(cfg.stickerPerDay ?? 0) || 0)
         const usedToday = stickerSentToday(HOME)
-        if (perDay === 0) return { ok: false, blocked: 'sticker_cap', error: '每日贴纸额度为 0' }
-        if (usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
+        // ⭐ 2026-10-25 老大要求「发几个表情不设上限」⇒ perDay=0 = 不限（以前 0 是"禁止"）
+        if (perDay > 0 && usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
         if (args?.confirm !== true) {
           return { ok: true, sent: false, needsConfirm: true, kind: 'image', to, to_id: toId || undefined,
             sticker: { key: st.key, name: st.name, kind: st.kind, thumb: st.thumb, url: imgUrl },
@@ -529,7 +572,11 @@ const TOOLS = [
         return { ok: true, sent: false, needsConfirm: true, to, to_id: toId || undefined, draft: text.slice(0, 1500), len: text.length, note: '没发送 —— 先把草稿给使用者看' }
       }
       if (args?.dry !== true) {
-        const g = await awaitGate(HOME, 'dm', rateOpts())
+        // ⭐ 2026-10-25：私信只发给老大（owner_only）⇒ 夜间静默 + 小时/日上限豁免；
+        //    拟人间隔与熔断照旧（公开动作的上限不受影响）。
+        const g = await awaitGate(HOME, 'dm', {
+          ...rateOpts(), safeQuiet: false, maxActionsPerHour: 999, maxActionsPerDay: 999,
+        })
         if (!g.ok) return rateBlocked(g)
       }
       const argv = []
@@ -578,12 +625,13 @@ const TOOLS = [
       const bad = needLogin() || needSetup()
       if (bad) return bad
       const aweme = String(args?.aweme_id || '').trim()
-      const text = String(args?.text || '').trim()
+      const rawText = String(args?.text || '').trim()
       const replyTo = String(args?.comment_id || '').trim()
       const rootCid = String(args?.root_comment_id || '').trim()
       const replyToUid = String(args?.reply_to_uid || '').trim()
       const replyToText = String(args?.reply_to_text || '').trim()
       const cfg = config()
+      const text = withTitle(rawText, cfg)
       if (!aweme) return { ok: false, error: '缺 aweme_id' }
       if (!text) return { ok: false, error: '正文是空的' }
       if (text.length > 500) return { ok: false, error: `正文太长（${text.length} 字）` }
@@ -603,7 +651,7 @@ const TOOLS = [
       /* ── 大肥鱼自主行为硬规则（与 host 共用 lib/engage.mjs） ── */
       if (!replyTo) {
         // 顶层主动评论：不是每条都评，受每日上限（默认 3）
-        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 3))
+        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 0))
         if (!cap.ok) {
           noteSkipped(HOME, 'proactive_cap')
           return { ok: false, blocked: 'proactive_cap', error: `今天主动评论已到上限（${cap.used}/${cap.max} 条）—— 不是每条都评`, hint: '去设置把「每天最多主动评论几条」调大，或明天再发。' }
@@ -617,7 +665,7 @@ const TOOLS = [
             return { ok: false, blocked: 'unfriendly', skipped: c.reason, error: `对方这条属于「${c.label}」，按规矩不回（只回善意、好回答的）` }
           }
         }
-        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 10) })
+        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 0) })
         if (!rc.ok) {
           noteSkipped(HOME, rc.reason, replyToUid)
           if (rc.reason === 'person_cap') {
@@ -792,6 +840,7 @@ const TOOLS = [
         aweme_id: { type: 'string', description: '作品/图文 id' },
         name: { type: 'string', description: '要 @ 的人的抖音昵称（必须和对方昵称完全一致）' },
         text: { type: 'string', description: '评论正文（≤500 字；不用自己写 @昵称，工具会自动加）' },
+        sec_uid: { type: 'string', description: '【可选】被 @ 人的 sec_uid —— 给了就走 API + text_extra（1 秒发出、有 cid），不给才用 UI 点选。@ 老大时不必给（自动用「私信发给谁」那位）' },
         confirm: { type: 'boolean', description: '🔴 必须由使用者当场同意后传 true，否则只回草稿' },
         dry: { type: 'boolean', description: 'true = 只走到点选完就停（不发布），用于验证昵称搜不搜得到' },
       },
@@ -821,8 +870,89 @@ const TOOLS = [
       }
       // ⭐ 风控闸（v0.3.9）：dry 只点选不发布，不过闸
       if (args?.dry !== true) {
-        const g = await awaitGate(HOME, 'mention', rateOpts())
+        // ⭐ 评论区 @ 老大 与私信分享**分开记额度**（各走各的计数；0 = 不限）
+        const g = await awaitGate(HOME, 'mention', { ...rateOpts(), kindDayCap: Number(config().shareMentionPerDay) || 0 })
         if (!g.ok) return rateBlocked(g)
+      }
+      /**
+       * ⭐ 2026-10-25：有 sec_uid 就先走 API + text_extra（实测服务端保住 sec_uid、对方能收到通知），
+       *    比 UI 点选快 30 倍还有 cid；UI 只作兜底（它慢、拿不到 cid，且实测有时点了没发出去）。
+       */
+      /**
+       * ⭐ 2026-10-27（真因订正）：**UI 点选是唯一能真 @ 的路**。
+       *    真因：评论区发布被风控要求过一次短信验证（「接收短信验证码」）—— 没过之前点发布只回
+       *    200 空 body、输入框不清空；过了之后 UI 点选发布成功、服务端**保住 mention 实体**
+       *    （实测 cid 7701038612288750351，text_extra 原样保留，老大确实收到「@ 了我」通知）。
+       *    API 直发虽然快、有 cid，但 mention 被服务端剥掉（三组对照实测）⇒ 只当兜底。
+       */
+      let uiVerifyNeeded = false
+      if (args?.dry !== true) {
+        let r0 = runNode('comment-mention-ui.mjs', ['--aweme', aweme, '--name', name, '--text', text], 300_000)
+        /** 2026-10-28：@ 时好时坏 ⇒ 非验证类失败重试一次 */
+        let j0 = pickJson(r0.stdout)
+        if (j0 && !j0.ok && !j0.verification_required) {
+          r0 = runNode('comment-mention-ui.mjs', ['--aweme', aweme, '--name', name, '--text', text], 300_000)
+          j0 = pickJson(r0.stdout)
+        }
+        if (j0?.ok) {
+          markAction(HOME, 'mention', rateOpts())
+          return {
+            ...j0, via: 'ui-mention', mention: name, text, mention_verified: true,
+            note: '真 @ 走 UI 点选 —— mention 实体保住了，对方会收到「@ 了我」通知。⚠️ UI 路径的 cid 是发完回查评论列表找回的（能删、能回读 text_extra）。',
+          }
+        }
+        if (j0?.verification_required) {
+          uiVerifyNeeded = true
+        } else if (j0) {
+          rateFailFromText('mention', j0, r0.stdout, r0.stderr)
+        }
+      }
+      /**
+       * 🔴 2026-10-28：验证没过就**不要用 API 假装发出去** ——
+       *    那样只会留下一条纯文字「@昵称 …」的评论，对方收不到通知（老大报的就是这个）。
+       */
+      if (uiVerifyNeeded) {
+        return {
+          ok: false, verification_required: true, aweme_id: aweme, mention: name, text,
+          error: '要真 @ 得先过一次抖音短信验证（评论区发布风控）：验证没过之前发布的评论会被静默丢弃',
+          hint: '让使用者跑：node tools/comment-verify.mjs --aweme ' + aweme + ' --request-code，拿到 6 位码后 --code <码>；过了之后 UI 点选就能真 @ 上。',
+        }
+      }
+      const cfgNow = config()
+      const nameSec = String(args?.sec_uid || '').trim()
+        || (name && String(cfgNow.dmTo || '').trim() === name ? String(cfgNow.dmToId || '').trim() : '')
+      if (args?.dry !== true && nameSec) {
+        const body = text.startsWith('@') ? text : `@${name}  ${text}`
+        const ar = runNode('comment-api.mjs', ['--aweme', aweme, '--text', body, '--mention-secuid', nameSec], 180_000)
+        const aj = pickJson(ar.stdout)
+        if (aj?.ok) {
+          markAction(HOME, 'mention', rateOpts())
+          /**
+           * ⭐ 2026-10-27：**发出去 ≠ @ 到了**。实测抖音 web 端发评论时服务端会把 mention 实体剥掉
+           *    （老大 / 视频作者 / 普通网友三种目标都试过，关注后也一样），这时对方收不到 @ 通知 ——
+           *    自动补一张私信卡片才是真通知（同一条视频两路不会重复，channel-log 保证）。
+           */
+          const dropped = aj.mention_dropped === true || aj.mention_kept === false
+          if (dropped) {
+            const to = String(cfgNow.dmTo || '').trim()
+            const toId = String(cfgNow.dmToId || '').trim()
+            let fb = { ok: false, skipped: 'no_dm_to' }
+            if (to) {
+              const argv2 = [aweme, to]
+              if (toId) argv2.push('--to-id', toId)
+              const rr = runNode('card-share.mjs', argv2, 200_000)
+              fb = pickJson(rr.stdout) || { ok: false, error: '补卡片没返回结果' }
+            }
+            return {
+              ...aj, via: 'api-mention', mention: name, text: body, mention_verified: false, mention_dropped: true,
+              fallback_dm: { ok: Boolean(fb.ok), sent: Boolean(fb.sent), blocked: fb.blocked, error: fb.error, to },
+              note: '评论发出去了，但**平台把 @ 实体剥掉**了 —— 他收不到 @ 通知；'
+                + (fb.ok ? '已自动补一张私信卡片通知他。' : '补卡片也没成，需要在报告里说明。'),
+            }
+          }
+          return { ...aj, via: 'api-mention', mention: name, mention_verified: true, text: body, note: '真 @ 走 API + text_extra（回读确认 sec_uid 保住了），对方能收到 @ 通知' }
+        }
+        rateFailFromText('mention', aj, ar.stdout, ar.stderr)
       }
       const argv = ['--aweme', aweme, '--name', name, '--text', text]
       if (args?.dry === true) argv.push('--dry')
@@ -834,6 +964,36 @@ const TOOLS = [
         else rateFailFromText('mention', j, r.stdout, r.stderr)
       }
       return j
+    },
+  },
+  {
+    name: 'douyin_mood',
+    title: '刷抖音 · 心情（情绪内核）',
+    description: '看 / 记你自己的心情（不设档位，外放由你按场合决定）。'
+      + 'action=read 看此刻什么心情、今天整体、最近轨迹；action=feel 记一笔刚发生的事（看到好笑的/被治愈/被抬杠/老大来了…），心情会跟着变。'
+      + '⭐ 心情不是任务：不记也不会错，它只影响你说话的口气，不影响该做的事。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['read', 'feel'], description: 'read / feel' },
+        kind: { type: 'string', description: 'action=feel：' + Object.keys(MOOD_EVENTS).join(' / ') },
+        note: { type: 'string', description: '一句话为什么（写进轨迹）' },
+        strength: { type: 'number', description: '强度 0.5~1.5，默认 1' },
+      },
+      additionalProperties: false,
+    },
+    handler: (a = {}) => {
+      ensureMood(HOME)
+      if (String(a.action || 'read') === 'feel') {
+        const r = moodFeel(HOME, String(a.kind || ''), {
+          note: String(a.note || '').slice(0, 120),
+          strength: Math.max(0.4, Math.min(1.5, Number(a.strength) || 1)),
+        })
+        if (!r.ok) return r
+        return { ok: true, label: r.label, v: Number(r.v.toFixed(3)), a: Number(r.a.toFixed(3)), why: r.why }
+      }
+      const g = moodGet(HOME)
+      return { ok: true, ...g, kinds: Object.keys(MOOD_EVENTS) }
     },
   },
   {
@@ -899,6 +1059,72 @@ const TOOLS = [
     },
   },
   {
+    name: 'douyin_sticker_make',
+    title: '刷抖音 · 自己做表情包',
+    description: '自己做一个表情包：① from_aweme + at 从视频某一秒截帧（看到喜欢的画面就存）；② from_file 拿现成图片/表情再加一句 caption；③ text 纯原创文字表情。做完进表情库（pending）——你必须先 Read 返回的 file 看清画面，再用 douyin_sticker_review 决定 approve/block，没审过的发不出去。做不做、做几张全由你自己判断。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_aweme: { type: 'string', description: '来源视频 id（三选一）' },
+        at: { type: 'number', description: '截第几秒（默认 1.5）' },
+        from_file: { type: 'string', description: '来源图片本地路径（三选一）' },
+        text: { type: 'string', description: '纯原创文字表情的内容（三选一）' },
+        caption: { type: 'string', description: '可选：底部加一句大字' },
+        name: { type: 'string', description: '可选：起个名字' },
+        size: { type: 'number', description: '边长像素（默认 480）' },
+      },
+      additionalProperties: false,
+    },
+    handler: (args = {}) => {
+      const argv = []
+      const aw = String(args.from_aweme || '').trim()
+      const ff = String(args.from_file || '').trim()
+      const tx = String(args.text || '').trim()
+      if (aw) argv.push('--from-aweme', aw, '--at', String(Number(args.at) || 1.5))
+      else if (ff) argv.push('--from-file', ff)
+      else if (tx) argv.push('--text', tx)
+      else return { ok: false, error: '要给来源：from_aweme / from_file / text 三选一' }
+      if (args.caption) argv.push('--caption', String(args.caption))
+      if (args.name) argv.push('--name', String(args.name))
+      if (args.size) argv.push('--size', String(args.size))
+      const r = runNode('sticker-make.mjs', argv, 260_000)
+      let j = null
+      const raw = String(r.stdout || '').trim()
+      try { j = JSON.parse(raw) } catch { j = null }
+      if (!j) {
+        try { j = JSON.parse(raw.split(/\r?\n/).filter(Boolean).pop()) } catch { j = null }
+      }
+      if (!j || !j.ok) return { ok: false, error: (j && j.error) || '做表情失败', stderr: String(r.stderr || '').slice(-300) }
+      return { ...j, stats: stickerStats(HOME) }
+    },
+  },
+  {
+    name: 'douyin_sticker_collect',
+    title: '刷抖音 · 评论区捡表情包',
+    description: '从某条视频的评论区把别人发的图片/表情下载下来、登记进表情库（pending）。看到喜欢的就收，收完先 Read 返回的 files 看画面，再用 douyin_sticker_review 决定 approve/block。只在真的觉得好玩时收，别每条都扫（费时间费流量）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        aweme_id: { type: 'string', description: '从哪条视频的评论区捡' },
+        pages: { type: 'number', description: '翻几页评论（默认 2，最多 6）' },
+        max: { type: 'number', description: '最多存几张（默认 8）' },
+      },
+      required: ['aweme_id'],
+      additionalProperties: false,
+    },
+    handler: (args = {}) => {
+      const aw = String(args.aweme_id || '').trim()
+      if (!aw) return { ok: false, error: '缺 aweme_id' }
+      const argv = ['--aweme', aw, '--pages', String(Math.max(1, Math.min(Number(args.pages) || 2, 6))),
+        '--max', String(Math.max(1, Math.min(Number(args.max) || 8, 30))), '--ingest', '1']
+      const r = runNode('comment-sticker-harvest.mjs', argv, 300_000)
+      let j = null
+      try { j = JSON.parse(String(r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop()) } catch { j = null }
+      if (!j || !j.ok) return { ok: false, error: (j && j.error) || '捡表情失败', stderr: String(r.stderr || '').slice(-300) }
+      return { ...j, stats: stickerStats(HOME) }
+    },
+  },
+  {
     name: 'douyin_comment_sticker',
     title: '刷抖音 · 发表情包',
     description: '在评论区发一个表情包（平台贴纸优先，走 publish 原生 sticker_id；自定义图片/GIF 走评论框图片上传）。贴纸来自自己收集且审核通过的表情库。给 comment_id 是回某条，不给是顶层。受风控节奏、每日上限、每日贴纸上限约束，要 confirm 才真发。图片/GIF 需要该号有图片评论权限（老号/实名号通常有），没有入口会明确返回 image_uploader，不谎报。',
@@ -952,19 +1178,18 @@ const TOOLS = [
       if (mode === 'image' && !imageUrl) {
         return { ok: false, unsupported: 'custom_image_no_url', error: '这张自定义图片没有可取地址（url/thumb 为空），无法上传' }
       }
-      const perDay = Math.max(0, Number(cfg.stickerPerDay ?? 5) || 0)
+      const perDay = Math.max(0, Number(cfg.stickerPerDay ?? 0) || 0)
       const usedToday = stickerSentToday(HOME)
-      if (perDay === 0) return { ok: false, blocked: 'sticker_cap', error: '每日贴纸额度为 0' }
-      if (usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
+      if (perDay > 0 && usedToday >= perDay) return { ok: false, blocked: 'sticker_cap', used: usedToday, max: perDay, error: `今天发表情已到上限（${usedToday}/${perDay}），明天再发` }
       if (!replyTo) {
-        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 3))
+        const cap = canProactiveComment(HOME, Number(cfg.proactiveCommentPerDay ?? 0))
         if (!cap.ok) return { ok: false, blocked: 'proactive_cap', error: `今天主动评论（含表情）已到上限（${cap.used}/${cap.max}），明天再继续` }
       } else {
         if (cfg.replyKindOnly !== false && replyToText) {
           const c = classifyReply(replyToText)
           if (!c.ok) { noteSkipped(HOME, c.reason, replyToUid); return { ok: false, blocked: 'unfriendly', skipped: c.reason, error: `对方这条属于「${c.label}」，按规矩不发表情回` } }
         }
-        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 10) })
+        const rc = canReplyTo(HOME, replyToUid, { perPerson: Number(cfg.replyPerPerson ?? 2), perDay: Number(cfg.replyPerDay ?? 0) })
         if (!rc.ok) {
           noteSkipped(HOME, rc.reason, replyToUid)
           if (rc.reason === 'person_cap') return { ok: false, blocked: 'person_cap', error: `今天已回过这个人 ${rc.personUsed} 次（上限 ${rc.perPerson}），不再发表情回` }

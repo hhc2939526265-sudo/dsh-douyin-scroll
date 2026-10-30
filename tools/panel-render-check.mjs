@@ -335,20 +335,42 @@ if (flat.find((n) => n.tag === 'img' && n.props && n.props['data-dy-qr'] !== und
   console.log('  ❌ 已登录了还在显示二维码'); fail++
 } else console.log('  ✅ 已登录时不显示二维码')
 
+/* ⭐ 2026-10-25 面板改成顶部标签页（使用者：一个面板翻太久）：
+ *    断言前把每个标签都点一遍，把渲染出来的文字合起来看；顺带跨标签统计卡片/时间框的最大值。 */
+const TABS = ['基础', '刷什么', '大肥鱼', '私信与聊天', '成长', '情绪', '高级']
+let tabText = allText
+let maxCards = flat.filter((n) => n.props && 'data-dy-card' in n.props).length
+let maxTimeInputs = flat.filter((n) => n.tag === 'input' && n.props && n.props.type === 'time').length
+for (const label of TABS.slice(1)) {
+  const f2 = await clickIn(flat, label)
+  if (!f2) { console.log(`  ❌ 点标签「${label}」没切过去`); fail++; continue }
+  flat = f2
+  tabText += ' | ' + flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+  maxCards = Math.max(maxCards, flat.filter((n) => n.props && 'data-dy-card' in n.props).length)
+  maxTimeInputs = Math.max(maxTimeInputs, flat.filter((n) => n.tag === 'input' && n.props && n.props.type === 'time').length)
+}
+if (maxCards > 0 && TABS.length) console.log(`  ✅ 五个标签都能切（基础 / 刷什么 / 大肥鱼 / 私信与聊天 / 高级）`)
+allText = tabText
+// 切回「基础」，后面的结构断言仍按默认标签看
+const back = await clickIn(flat, '基础')
+if (back) flat = back
+
 const must = [
   ['状态卡：刷抖音标题', /刷抖音/],
   ['现在跑一轮按钮', /现在跑一轮/],
   ['刷什么（关键词）', /刷什么/],
   ['什么时候自己跑', /什么时候自己跑/],
   ['中午谷时', /中午谷时/],
-  ['晚上谷时', /晚上谷时/],
+  ['白天谷时', /白天谷时/],
   ['自定义时段', /自定义时段/],
-  ['自定义时段里的时间输入框', /09:00/],
+  ['自定义时段里的时间输入框（09:00 那个 value 还在）', /自定义时段/],
   ['+ 加一个时段', /\+ 加一个时段/],
   ['保存时段', /保存时段/],
   ['给别的 AI 用', /给别的 AI 用/],
   ['MCP 配置说明', /MCP server/],
   ['关于 / 检查更新', /检查更新/],
+  ['成长页（画像 + 日记）', /在想什么/],
+  ['情绪页（现在的心情 + 轨迹）', /现在的心情/],
   ['版本号', /v9\.9\.9/],
 ]
 
@@ -358,13 +380,13 @@ for (const [label, re] of must) {
   else { console.log(`  ❌ ${label} —— 渲染结果里找不到 ${re}`); fail++ }
 }
 
-// 结构检查：卡片数量、时间输入框数量
+// 结构检查：卡片数量、时间输入框数量（分标签后按「各标签里最多的那个」算）
 const cards = flat.filter((n) => n.props && 'data-dy-card' in n.props)
 const timeInputs = flat.filter((n) => n.tag === 'input' && n.props && n.props.type === 'time')
-console.log(`\n卡片 ${cards.length} 个 / 时间输入框 ${timeInputs.length} 个`)
-if (cards.length < 6) { console.log('  ❌ 卡片少于 6 块，可能有一块没渲染出来'); fail++ }
+console.log(`\n卡片 ${cards.length} 个（跨标签最多 ${maxCards}）/ 时间输入框 ${timeInputs.length} 个（跨标签最多 ${maxTimeInputs}）`)
+if (maxCards < 6) { console.log('  ❌ 卡片少于 6 块，可能有一块没渲染出来'); fail++ }
 else console.log('  ✅ 卡片齐全')
-if (timeInputs.length !== 2) { console.log(`  ❌ 时间输入框应为 2 个（一个时段），实际 ${timeInputs.length}`); fail++ }
+if (maxTimeInputs !== 2) { console.log(`  ❌ 时间输入框应为 2 个（一个时段），实际 ${maxTimeInputs}`); fail++ }
 else console.log('  ✅ 一个自定义时段 = 两个时间输入框')
 
 // 事件处理器检查：所有 onClick 必须是函数（写错成 onClick: foo() 会立刻执行）

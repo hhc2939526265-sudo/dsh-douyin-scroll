@@ -44,6 +44,7 @@ tools/im-http.py —— 纯 HTTP 读私信（不碰浏览器，只读）
 """
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -93,8 +94,80 @@ def out(obj):
     sys.exit(0 if obj.get("ok") else 1)
 
 
+_MEDIA_RE = re.compile(r"(douyinpic|douyin\.com/aweme|sticker|emoji|\.gif|\.webp|\.png|\.jpe?g)", re.I)
+
+
+def _media_urls(obj, found=None, depth=0):
+    """从消息内容 JSON 里挖图片 / 表情地址。
+
+    抖音纯图片、纯表情消息的 text 是空的，以前整条被丢掉 —— 现在至少能知道
+    「老大发过一个表情包」，并把地址交给宿主的表情库（先待审，审过才能用）。
+    """
+    if found is None:
+        found = []
+    if depth > 6 or len(found) >= 6:
+        return found
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _media_urls(v, found, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _media_urls(v, found, depth + 1)
+    elif isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("//"):
+            s = "https:" + s
+        if s.startswith("http") and _MEDIA_RE.search(s) and s not in found:
+            found.append(s)
+    return found
+
+
 if not READ:
     out({"ok": False, "error": "只支持 --read（这是个只读工具）"})
+
+
+def _sniff_ext(b):
+    """按文件头判断图片后缀 —— 宿主 Read 图片靠扩展名，存成 .img 它读不了。"""
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if b[:3] == b"GIF":
+        return ".gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return ".webp"
+    if b[:2] == b"\xff\xd8":
+        return ".jpg"
+    return ".jpg"
+
+
+def _save_sticker(url, idx=0):
+    """把表情包 / 图片消息**下载到本地**，返回文件路径（失败返回 ""）。
+
+    为什么必须下载：宿主（大肥鱼）只读得到 "text"，给个 URL 它是看不见内容的 ——
+    老大发来个表情包，它只能说"这是张空卡片"。存成本地文件后，它可以用 Read 真正看一眼。
+    """
+    try:
+        import hashlib
+        h = hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
+        d = os.path.join(HOME, "inbox")
+        os.makedirs(d, exist_ok=True)
+        stem = os.path.join(d, "stk-%s-%d" % (h, idx))
+        for ext in (".jpg", ".png", ".gif", ".webp"):
+            p = stem + ext
+            if os.path.exists(p) and os.path.getsize(p) > 2048:
+                return p
+        r = creq.get(url, impersonate="chrome", timeout=25,
+                     headers={"Referer": "https://www.douyin.com/",
+                              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"})
+        if r.status_code == 200 and len(r.content) > 1024:
+            ext = _sniff_ext(r.content)
+            p = stem + ext
+            with open(p, "wb") as f:
+                f.write(r.content)
+            return p
+    except Exception:
+        pass
+    return ""
+
 
 # ───────────────────────── protobuf 编解码（最小实现，够用就好） ─────────────────────────
 # ⭐ Python int 天然任意精度：19 位的 short_id / 毫秒时间戳都不会被截断
@@ -315,22 +388,40 @@ def main():
             core = parse(g1(conv, 1) or b"")
             conv_id = as_str(g1(core, 1))
             messages = []
-            for m in conv.get(2) or []:
+            for _mi, m in enumerate(conv.get(2) or []):
                 if not isinstance(m, bytes):
                     continue
                 f = parse(m)
                 sender = as_str(g1(f, 7))            # field7 = 发送者 uid
                 content_raw = as_str(g1(f, 8))       # field8 = 正文 JSON
                 at_ms = int(g1(f, 10) or 0)          # field10 = 毫秒时间戳
-                text, kind = "", "text"
+                text, kind, sticker = "", "text", ""
                 try:
                     j = json.loads(content_raw)
+                    # 有些内容字段是「JSON 字符串里又套了一层 JSON」（活动/表情那类），解开再用
+                    if isinstance(j, str):
+                        try:
+                            j = json.loads(j)
+                        except Exception:
+                            j = {}
+                    if not isinstance(j, dict):
+                        j = {}
                     text = str(j.get("text") or j.get("content_title") or "").strip()
                     kind = "card" if int(j.get("aweType") or 0) == 800 else "text"
+                    # ⭐ 2026-10-25：纯图片 / 表情包消息原来 `if not text: continue` 整条丢掉，
+                    #    连"老大发过表情包"都看不见。这里把图片地址抠出来，标成 sticker 交给宿主收集。
+                    if not text:
+                        med = _media_urls(j)
+                        if med:
+                            sticker = med[0]
+                            kind = "sticker" if int(j.get("aweType") or 0) in (0, 501, 516) else "image"
+                            text = "[表情包]" if kind == "sticker" else "[图片]"
                 except Exception:
                     text = content_raw[:120]
                 if not text:
                     continue
+                # ⭐ 有图就当场下载一份到本地，让宿主能"看见"内容（否则它只说得出"空卡片"）
+                sticker_file = _save_sticker(sticker, _mi) if sticker else ""
                 # ⭐ 排序不信线序（协议顺序实测过不稳定），直接按时间戳排旧→新
                 messages.append({
                     "_ts": at_ms,
@@ -338,6 +429,8 @@ def main():
                     "text": text[:200],
                     "at": iso(at_ms),
                     "kind": kind,
+                    **({"sticker": sticker} if sticker else {}),
+                    **({"sticker_file": sticker_file} if sticker_file else {}),
                 })
             messages.sort(key=lambda x: x["_ts"] or 0)
             for m in messages:
@@ -368,8 +461,33 @@ def main():
             except Exception:
                 pass
             if not wanted_uid:
-                match_note = "sec_uid 反查失败（拿不到这个人的数字 uid）——不猜，退浏览器"
-            else:
+                # ⭐ 2026-10-26：`/aweme/v1/web/user/profile/other/` 开始要签名（本机拿不到），
+                #   sec_uid 反查 100% 失败 ⇒ 退回「记住过的映射」和「唯一私聊会话」两条路。
+                #   这不是"猜人"：映射只会在本机写入，且写入时必须是唯一私聊会话。
+                try:
+                    mp = json.load(open(os.path.join(HOME, "dm_uid_map.json"), encoding="utf-8"))
+                except Exception:
+                    mp = {}
+                if isinstance(mp, dict) and mp.get(PEER_SEC):
+                    wanted_uid = str(mp[PEER_SEC])
+                    match_note = "反查接口挂了 ⇒ 用本机记住的 uid（%s）" % wanted_uid
+                else:
+                    priv = [c for c in convs if c["type"] == 1 and c["peer_uid"] != my_uid]
+                    if len(priv) == 1:
+                        wanted_uid = priv[0]["peer_uid"]
+                        try:
+                            json.dump({PEER_SEC: wanted_uid},
+                                      open(os.path.join(HOME, "dm_uid_map.json"), "w", encoding="utf-8"),
+                                      ensure_ascii=False, indent=1)
+                        except Exception:
+                            pass
+                        match_note = "反查接口挂了 ⇒ 用唯一的私聊会话（uid=%s），已记住" % wanted_uid
+                    elif len(priv) == 0:
+                        match_note = "反查失败，且没有任何私聊会话"
+                    else:
+                        match_note = "反查失败，且有 %d 个私聊会话 —— 不猜，退浏览器" % len(priv)
+            # ⭐ 不管 wanted_uid 是反查来的还是兜底来的，都要做这一步严格相等核验
+            if wanted_uid:
                 hit = next((c for c in convs
                             if c["type"] == 1 and c["peer_uid"] == wanted_uid), None)
                 if hit:
@@ -378,7 +496,7 @@ def main():
                         "conv_id": hit["conv_id"], "messages": hit["messages"],
                     }
                 else:
-                    match_note = "这个人不在已建立会话里（陌生人消息走别的接口，本工具不覆盖）"
+                    match_note = "这个人不在已建立会话里（uid=%s；陌生人消息走别的接口，本工具不覆盖）" % wanted_uid
 
         result = {
             "ok": True, "via": "http",

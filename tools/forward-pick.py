@@ -120,6 +120,42 @@ def get(s, path, quiet=True):
         return None
 
 
+def search_by_keyword(s, kw, pages=1, count=12):
+    """
+    ⭐⭐ 按**关键词**搜视频（2026-10-25 加）。
+
+    为什么必须加：这个脚本原来只拉「推荐流 3 页 + 热榜」，**从不按关键词发请求** ——
+    刷到什么完全由小号的观看历史决定，所以设了 10 个关键词，实际永远在刷小猫小狗。
+
+    走的是 `/aweme/v1/web/search/item/`：实测这个端点**不需要 a_bogus**
+    （对比 `/general/search/single/` 会返回 `search_nil_type: verify_check`、data 恒空），
+    带 cookie 就能拿到 `data[].aweme_info`（完整 aweme：文案/作者/四个互动数/封面/播放地址）。
+
+    任何一条失败都只是少几条候选，绝不让整轮崩。
+    """
+    import urllib.parse
+    got, cursor = [], 0
+    for _ in range(max(1, int(pages or 1))):
+        q = ("keyword=%s&count=%d&cursor=%d&search_source=normal_search"
+             "&query_correct_type=1&is_filter_search=0") % (
+            urllib.parse.quote(str(kw)), max(1, int(count or 12)), cursor)
+        j = get(s, "/aweme/v1/web/search/item/?%s&%s" % (COMMON, q), quiet=False)
+        if not j:
+            break
+        for e in (j.get("data") or []):
+            if not isinstance(e, dict):
+                continue
+            ai = e.get("aweme_info")
+            if isinstance(ai, dict) and ai.get("aweme_id"):
+                ai["_kw"] = str(kw)
+                got.append(ai)
+        cursor = int(j.get("cursor") or (cursor + int(count or 12)))
+        if not j.get("has_more"):
+            break
+        time.sleep(random.uniform(1.2, 2.6))
+    return got
+
+
 def load_collector():
     """
     ⭐ 读设置页那两个旋钮（`collector.json`，由 index.js 的 syncCollectorCfg 写）。
@@ -155,6 +191,30 @@ def _first_url(node):
             if isinstance(u, str) and u.startswith("http"):
                 return u
     return ""
+
+
+# ⭐ 内容类型（2026-10-27 老大反馈）：AI 生成 / 剧情演绎 / 真实
+#    模型以前把 AI 短剧、影视剧当成真事去共情、去科普，一眼就是机器。
+#    这里只做**粗分类**，让 agent 知道"这条是演的 / 是 AI 做的"，评价口径要跟着变。
+_AI_WORDS = ("ai生成", "ai绘画", "ai视频", "ai创作", "ai短剧", "ai动画", "ai合成", "ai换脸", "aigc",
+             "sora", "即梦", "可灵", "runway", "pika", "midjourney", "虚拟人", "数字人", "ai配音")
+_DRAMA_WORDS = ("剧情", "短剧", "影视", "电影", "电视剧", "二创", "演绎", "角色扮演", "cosplay", "漫改",
+                "小说", "剧本", "预告", "解说", "混剪", "番剧", "动漫", "翻拍", "续写")
+
+
+def content_kind(a):
+    """ai = AI 生成/合成；drama = 剧情/影视演绎；real = 其它（真人真事，默认）"""
+    desc = (a.get("desc") or "")
+    low = desc.lower()
+    tags = " ".join(re.findall(r"#([^#\s]+)", desc)).lower()
+    hay = low + " " + tags
+    for w in _AI_WORDS:
+        if w in hay:
+            return "ai"
+    for w in _DRAMA_WORDS:
+        if w in tags:
+            return "drama"
+    return "real"
 
 
 def pick_media(a):
@@ -468,7 +528,12 @@ def grab_frames(s, r, a, want_frames, cfg):
     tmp_video = None
     if want_frames and video_url and ff:
         try:
-            fd, tmp_video = tempfile.mkstemp(suffix=".mp4", prefix="dyv_")
+            # ⚠️ 沙箱里系统临时目录（C:\WINDOWS\TEMP / %TEMP%）是**不可写**的，
+            #    mkstemp 会抛 PermissionError 被下面 except 吞掉 ⇒ 永远只有封面、没有视频帧。
+            #    所以临时视频固定落在 <HOME>\tmp 下。
+            _tdir = os.path.join(HOME, "tmp")
+            os.makedirs(_tdir, exist_ok=True)
+            fd, tmp_video = tempfile.mkstemp(suffix=".mp4", prefix="dyv_", dir=_tdir)
             os.close(fd)
             if _dl_bin(s, video_url, tmp_video, timeout=60):
                 dur = float(r.get("duration_s") or 0)
@@ -510,6 +575,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="store_true")
     ap.add_argument("--limit", type=int, default=10, help="最多取前几条（默认 10）")
+    ap.add_argument("--keywords", default="", help="这一轮抽到的关键词（逗号分隔）—— 每个都去搜一轮")
+    ap.add_argument("--kw-pages", type=int, default=1, help="每个关键词翻几页搜索（默认 1）")
+    ap.add_argument("--kw-count", type=int, default=12, help="每个关键词每页取几条（默认 12）")
+    # ⭐ 2026-10-29：老大的反馈「30 条里 23 条是旧货」。以前是等模型看完再自己对照 seen.md 跳过，
+    #    那 23 条旧货照样占掉了 30 个候选位。这里直接把判重表里的 id 传进来，采集阶段就丢掉。
+    ap.add_argument("--exclude-ids", default="", help="已经看过的 aweme_id（逗号分隔），采集时就跳过")
     ap.add_argument("--frames", dest="frames", action="store_true", help="抓高清封面+关键帧（默认开）")
     ap.add_argument("--no-frames", dest="frames", action="store_false", help="只出清单，不下载画面")
     ap.add_argument("--frame-count", type=int, default=0, help="时长未知时的兜底关键帧数（默认取设置，3）")
@@ -571,9 +642,34 @@ def main():
             walk_awemes(j, bag)
             meta.append({"src": "hot-search", "new": len(bag) - before, "status": j.get("status_code")})
 
+        # 3) ⭐ 按关键词搜索（2026-10-25 加）
+        #    老大反馈「总是小猫小狗、其它关键词的视频根本没有」—— 根因是这一轮从不按词搜。
+        #    每个关键词都搜，搜到的候选和推荐流混在一起打分；来源记在 meta 里，报告能看出覆盖。
+        kws = [k.strip() for k in str(getattr(args, "keywords", "") or "").split(",") if k.strip()]
+        for kw in kws:
+            before = len(bag)
+            err = ""
+            items = []
+            try:
+                items = search_by_keyword(s, kw, args.kw_pages, args.kw_count)
+            except Exception as e:      # 单个词失败不影响整轮
+                err = str(e)[:80]
+            for a in items:
+                aid = str(a.get("aweme_id") or "")
+                if aid and aid not in bag:
+                    bag[aid] = a
+            meta.append({"src": "search:%s" % kw, "new": len(bag) - before,
+                         "status": (0 if not err else err)})
+            time.sleep(random.uniform(1.5, 3.0))   # 词与词之间也停一下，别像批量爬虫
+
     now = time.time()
     rows = []
+    # ⭐ 采集阶段就丢掉"已经看过"的（判重表由调用方传进来）——别让旧货占掉候选位
+    exclude_ids = {x.strip() for x in str(getattr(args, "exclude_ids", "") or "").split(",") if x.strip()}
     for aid, a in bag.items():
+        if str(aid) in exclude_ids:
+            dropped["already_seen"] = dropped.get("already_seen", 0) + 1
+            continue
         desc = (a.get("desc") or "").strip()
         if not desc:
             dropped["no_desc"] += 1
@@ -615,21 +711,103 @@ def main():
             "share_desc": (si.get("share_link_desc") or "").replace("%s", official).strip(),
             # 网页地址（能在浏览器打开，但不是分享链接）
             "web_url": "%s/video/%s" % (BASE, aid),
+            # ⭐ 这条是从哪个关键词搜来的（推荐流/热榜来的就是空串）
+            "kw": a.get("_kw") or "",
+            # ⭐ 内容类型（2026-10-27 老大反馈：AI 短剧/影视剧被当成真事去共情，太像人机）
+            "kind": content_kind(a),
         })
 
     rows.sort(key=lambda r: -r["score"])
-    top = rows[:max(1, args.limit)]
+    limit = max(1, args.limit)
+
+    # ⭐ 去同质（2026-10-25 老大要求：「大多都小猫小狗且内容差不多」）：
+    #   纯按分数取 top 会被爆款宠物/同一作者占满，所以在候选池里按「同词最多 40%、同作者最多 2 条」挑，
+    #   不够再按分数补齐。目的是让这一轮看到的是"好几个方向的抖音"，而不是同一个信息流的 20 条切片。
+    def _pick_diverse(pool, n):
+        per_kw_cap = max(2, int(round(n * 0.4)))
+        per_author_cap = 2
+        picked, ck, ca = [], {}, {}
+        for r in pool:
+            # ⭐ 2026-10-29：推荐流/热榜来的（kw 为空）也算一个"来源组"，同样受 40% 上限约束。
+            #    以前空 kw 不限量 ⇒ 三页推荐流能把 top 全占满，关键词搜回来的反而进不来 ⇒
+            #    "只刷小猫小狗 + 30 条里 23 条旧货"。
+            k = (r.get("kw") or "").strip() or "推荐流"
+            a = (r.get("author") or "").strip()
+            if ck.get(k, 0) >= per_kw_cap:
+                continue
+            if a and ca.get(a, 0) >= per_author_cap:
+                continue
+            picked.append(r)
+            ck[k] = ck.get(k, 0) + 1
+            if a:
+                ca[a] = ca.get(a, 0) + 1
+            if len(picked) >= n:
+                return picked
+        have = {str(r["aweme_id"]) for r in picked}
+        for r in pool:
+            if str(r["aweme_id"]) in have:
+                continue
+            picked.append(r)
+            if len(picked) >= n:
+                break
+        return picked
+
+    top = _pick_diverse(rows, limit)
+
+    # ⭐ 2026-10-29：**覆盖兜底** —— 这一轮抽到的每个关键词，至少要有 1 条进 top。
+    #    做法：谁没进就用它的最佳候选换掉一条"推荐流"来的（推荐流本来就是同质化来源）。
+    want_kws = [k.strip() for k in str(getattr(args, "keywords", "") or "").split(",") if k.strip()]
+    kw_cover = {}
+    for r in top:
+        k = (r.get("kw") or "").strip()
+        if k:
+            kw_cover[k] = kw_cover.get(k, 0) + 1
+    for k in want_kws:
+        if kw_cover.get(k):
+            continue
+        cand = None
+        for r in rows:
+            if (r.get("kw") or "").strip() == k and all(str(r["aweme_id"]) != str(t["aweme_id"]) for t in top):
+                cand = r
+                break
+        if not cand:
+            print("⚠️ 关键词「%s」这一轮一条候选都没有" % k)
+            continue
+        slot = None
+        for i in range(len(top) - 1, -1, -1):
+            if not (top[i].get("kw") or "").strip():
+                slot = i
+                break
+        if slot is None:
+            continue
+        top[slot] = cand
+        kw_cover[k] = kw_cover.get(k, 0) + 1
+    if kw_cover:
+        print("本轮覆盖关键词：%s" % "、".join("%s×%d" % (k, v) for k, v in kw_cover.items()))
 
     # ⭐ 给入选候选抓画面（封面+自适应关键帧）和台词（字幕/Whisper），让模型真的"看得到、听得到"。任何失败都静默降级。
     frames_summary = {"on": want_frames, "with_video": 0, "cover_only": 0, "none": 0, "ffmpeg": bool(find_ffmpeg()),
                       "spoken": spoken_summary}
     if want_frames:
+        # ⭐ 2026-10-29：**时间预算**。抓帧要下整条视频（几十 MB）+ ffmpeg 抽 30 帧，
+        #    30 条候选能轻松跑过 7 分钟 —— 上一轮就是这样把调用方的 420 秒超时撑爆，
+        #    结果证据包没写出来、模型读到上一轮的旧文件（"30 条全在判重表里"）。
+        #    现在到点就停抓帧，剩下的只留封面，并把 frames_budget_hit 报上去。
+        budget_sec = float(os.environ.get("DOUYIN_FRAME_BUDGET_SEC") or 240)
+        t_frame0 = time.time()
         with creq.Session(impersonate="chrome") as fs:
             fs.headers.update({
                 "User-Agent": UA, "Cookie": cookie, "Referer": BASE + "/", "Origin": BASE,
                 "Accept-Language": "zh-CN,zh;q=0.9",
             })
             for r in top:
+                if time.time() - t_frame0 > budget_sec:
+                    frames_summary["budget_hit"] = frames_summary.get("budget_hit", 0) + 1
+                    r["frames"] = r.get("frames") or []
+                    r["frames_kind"] = "cover" if r["frames"] else "none"
+                    r["spoken"] = ""; r["spoken_kind"] = "off"
+                    frames_summary["cover_only" if r["frames"] else "none"] += 1
+                    continue
                 a = bag.get(str(r["aweme_id"])) or {}
                 frames, spoken, spoken_kind = grab_frames(fs, r, a, True, cfg)
                 r.pop("_video_url_ok", None); r.pop("_ffmpeg", None)
@@ -665,7 +843,8 @@ def main():
 
     os.makedirs(os.path.dirname(OUT_MD), exist_ok=True)
     with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump({"meta": meta, "frames": frames_summary, "rows": top, "dropped": dropped, "thresholds": limits}, f, ensure_ascii=False, indent=1)
+        json.dump({"meta": meta, "frames": frames_summary, "rows": top, "dropped": dropped, "thresholds": limits,
+                   "kw_cover": kw_cover}, f, ensure_ascii=False, indent=1)
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write("# 转发清单 %s\n\n" % datetime.now(CST).strftime("%Y-%m-%d %H:%M"))
         for i, r in enumerate(top, 1):

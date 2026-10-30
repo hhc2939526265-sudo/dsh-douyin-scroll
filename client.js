@@ -23,7 +23,8 @@ window.__ModuleLoader__.load({
      *    面板看起来"没变化"，很难判断是代码错了还是没加载。
      *    对一下面板右上角显示的 `v<版本>·b<N>` 就知道。
      */
-    const PANEL_BUILD = 15
+    const PANEL_BUILD = 23
+const TAB_LABELS = {"basic":"基础","feed":"刷什么","fish":"大肥鱼","chat":"私信与聊天","grow":"成长","mood":"情绪","adv":"高级"}
 
     const asJson = async (res) => {
       if (res.ok) return res.json()
@@ -44,6 +45,8 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));
   background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.06));}
 [data-dy-title]{font-size:13px;font-weight:600;}
+[data-dy-tabs]{display:flex;gap:6px;flex-wrap:wrap;padding:2px 0 4px;position:sticky;top:0;z-index:2;
+  background:transparent;}
 [data-dy-sub]{font-size:11px;line-height:17px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}
 [data-dy-row]{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 [data-dy-grow]{flex:1;min-width:0;}
@@ -224,6 +227,11 @@ window.__ModuleLoader__.load({
       const [acc, setAcc] = React.useState(null)
       // 人设（使用者自己那份）
       const [persona, setPersona] = React.useState(null)
+      // ⭐ 成长页（2026-10-25）：它自己的画像 + 每天日记
+      const [growth, setGrowth] = React.useState(null)
+      const [growthDay, setGrowthDay] = React.useState('')
+      // ⭐ 情绪页（2026-10-28）：现在什么心情、今天整体、最近轨迹
+      const [mood, setMood] = React.useState(null)
       // 私信对象：手动填的模式
       const [manualDm, setManualDm] = React.useState(null)
       // 每天挑几条（输入框草稿）
@@ -247,6 +255,11 @@ window.__ModuleLoader__.load({
       const [engDraft, setEngDraft] = React.useState({})
       // dsh 入口路径（输入框草稿）—— 2026-10-23 加，见「出问题了？」卡片
       const [dshBinDraft, setDshBinDraft] = React.useState(null)
+      /**
+       * ⭐ 顶部标签页（2026-10-25 使用者要求：面板太长、"所有东西都在一个面板要翻很久"）
+       *    basic 基础 / feed 刷什么 / fish 大肥鱼 / chat 私信与聊天 / adv 高级
+       */
+      const [tab, setTab] = React.useState('basic')
 
       const say = (t, tone) => { setMsg(t); setMsgTone(tone || '') }
 
@@ -268,6 +281,8 @@ window.__ModuleLoader__.load({
           } catch (e) {
             if (alive) say('读设置失败：' + String((e && e.message) || e), 'warn')
           }
+          // ⭐ 情绪页数据（2026-10-28）：开机先拿一次，进「情绪」页时再刷
+          try { const m = await jget('/mood'); if (alive && m && m.ok) setMood(m) } catch { /* 拿不到不影响用 */ }
         })()
         return () => { alive = false }
       }, [])
@@ -572,6 +587,40 @@ window.__ModuleLoader__.load({
         finally { setBusy('') }
       }
 
+      /** ⭐ 读「成长」页（2026-10-25）：它自己的画像 + 某天的日记 + 口味统计 */
+      const loadGrowth = async (day) => {
+        setBusy('growth')
+        try {
+          const q = day ? ('?day=' + encodeURIComponent(day)) : ''
+          const r = await jget('/growth' + q)
+          if (r && r.ok) {
+            setGrowth(r)
+            setGrowthDay(String(r.day || ''))
+          } else say('读成长页失败：' + ((r && r.error) || '未知'), 'warn')
+        } catch (e) { say('读成长页失败：' + String((e && e.message) || e), 'warn') }
+        finally { setBusy('') }
+      }
+
+      /** ⭐ 读「情绪」页（2026-10-28）：现在的心情、今天整体、最近轨迹 */
+      const loadMood = async () => {
+        try {
+          const r = await jget('/mood')
+          if (r && r.ok) setMood(r)
+          else say('读情绪页失败：' + ((r && r.error) || '未知'), 'warn')
+        } catch (e) { say('读情绪页失败：' + String((e && e.message) || e), 'warn') }
+      }
+
+      /** ⭐ 手动补写某天的日记（收工时间之外想先看一眼） */
+      const writeDiary = async (day) => {
+        setBusy('growthWrite')
+        try {
+          const r = await jpost('/growth/write', { day: day || '' })
+          if (r && r.ok) say('叫它写了，一两分钟后点「刷新」就能看到', 'good')
+          else say('起不来：' + ((r && r.error) || '未知'), 'warn')
+        } catch (e) { say('起不来：' + String((e && e.message) || e), 'warn') }
+        finally { setBusy('') }
+      }
+
       /** 存人设（空 = 删掉自己那份，退回默认） */
       const savePersona = async () => {
         if (!persona) return
@@ -688,6 +737,14 @@ window.__ModuleLoader__.load({
       const kwText = kws !== null ? kws : (Array.isArray(cfg.keywords) ? cfg.keywords.join('\n') : '')
 
       return h('div', { 'data-dy-page': '' },
+        /* ⭐ 顶部标签页（2026-10-25 使用者要求：「所有东西都在一个面板里，要翻很久」） */
+        h('div', { 'data-dy-tabs': '' },
+          Object.keys(TAB_LABELS).map((k) => h('button', {
+            'data-dy-mini': '', 'data-primary': tab === k ? '' : undefined,
+            style: { opacity: tab === k ? '1' : '.62', fontWeight: tab === k ? '600' : '400' },
+            onClick: () => setTab(k),
+          }, TAB_LABELS[k]))),
+        h('div', { 'data-dy-tab': 'basic', style: { display: tab === 'basic' ? 'contents' : 'none' } }, [
 
         /* ── 状态 ── */
         h('div', { 'data-dy-card': '' },
@@ -748,8 +805,8 @@ window.__ModuleLoader__.load({
             : null,
           guide !== null
             ? h('pre', { 'data-dy-pre': '', style: { maxHeight: '380px' } }, guide)
-            : null),
-
+            : null)
+        ]),h('div', { 'data-dy-tab': 'fish', style: { display: tab === 'fish' ? 'contents' : 'none' } }, [
         /* ── 自动发送开关（放在**最上面**，别埋在长面板底部） ── */
         h('div', { 'data-dy-card': '', 'data-dy-highlight': cfg.autoSend ? '' : undefined },
           h('div', { 'data-dy-row': '' },
@@ -794,15 +851,19 @@ window.__ModuleLoader__.load({
             : null,
           cfg.commentAtMe && cfg.autoSend
             ? h('div', { 'data-dy-sub': '', style: { marginTop: '4px' } },
-              '会在**最值得的那一条**下发一次，提醒内容以「@你的昵称」开头。'
+              '想 @ 几次由大肥鱼自己判断（不限条数）：它觉得该让你看就在评论区 @，也可以直接私信甩卡片 —— 两路平权。'
+              + '（同一楼最多回一次，不会反复刷。）'
               + (cfg.commentSelfName ? `（会 @「${cfg.commentSelfName}」）` : '（会 @ 你登录的这个号）'))
             : null,
-          /* 🔴 2026-10-23：使用者反馈「@ 不出来」—— 这里必须讲清楚真 @ 的前提 */
+          /* ✅ 2026-10-27 深夜：真因查清了（风控短信验证），过了验证之后 UI 点选能真 @ 上 */
           cfg.commentAtMe && cfg.autoSend
             ? h('div', { 'data-dy-sub': '', style: { marginTop: '4px', opacity: '.78' } },
-              '💡 真 @ 需要起无头 Chrome 走「点选弹层」流程（约 20-40 秒）：'
-              + '① 电脑上要装了 Chrome；② 要 @ 的昵称必须能在弹层里搜到（一般是关注/互关的人）；'
-              + '③ 只写「@昵称」文字、没走点选的评论，对方收不到通知 —— 这是抖音的限制，不是插件偷懒。')
+              '✅ 2026-10-27：真 @ 已修好 —— 走 UI 点选（服务端会保住 mention 实体），实测你手机上收到了「@ 了我」通知。'
+              + '唯一门槛是**评论区发布的短信验证**：抖音风控第一次（或到期后）会弹「接收短信验证码」，'
+              + '没过之前评论压根不入库（以前那些"没艾特上"全是这个）。过验证要你本人输码，'
+              + '跑一次 `node tools/comment-verify.mjs --aweme <视频id> --request-code` 再 `--code 六位码` 即可，之后长期有效。'
+              + '真没过之前，工具会用 API 兜底发普通评论并自动补一张**私信卡片**通知你。'
+              + '两者不会重复：@ 过的视频不再私信分享。')
             : null,
           /* 想 @ 别的号才需要填 */
           cfg.commentAtMe
@@ -819,6 +880,22 @@ window.__ModuleLoader__.load({
               }, '保存'))
             : null,
 
+          /* ⭐⭐ 评论区 @ 我 → 去评论区回（2026-10-26 老大要求） */
+          h('div', { 'data-dy-row': '', style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--ds-alias-border-l2,rgba(255,255,255,.08))' } },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '评论区 @ 我 → 自动回'),
+              h('div', { 'data-dy-sub': '' },
+                (cfg.atMeAutoReply !== false
+                  ? '✅ 开着：每 90 秒看一眼通知，**老大在评论区的 @ / 回复** 会由大肥鱼直接去那条评论下回一句（mode=api，有 cid）。'
+                  + '别人的 @ 不自动回（防钓鱼）。'
+                  : '关着：评论区 @ 不自动回，只在大肥鱼刷到那一轮里顺手回。'))),
+            h(Switch, {
+              on: cfg.atMeAutoReply !== false,
+              disabled: busy === 'patch',
+              onChange: (v) => patch({ atMeAutoReply: v }, v
+                ? '✅ 已打开「评论区 @ 我自动回」'
+                : '已关闭「评论区 @ 我自动回」'),
+            })),
           /* ⭐⭐ 聊天模式（2026-10-24）：使用者实测的「会话模式」进插件。
            *   每 N 秒静默读一次私信对象的会话（HTTP 快路径，不起浏览器），
            *   他来新消息就弹 Windows 通知。回话还是你来（或叫值班轮）。 */
@@ -835,6 +912,23 @@ window.__ModuleLoader__.load({
               onChange: (v) => patch({ chatWatch: v }, v
                 ? '✅ 已打开聊天模式（静默盯消息）'
                 : '已关闭聊天模式'),
+            })),
+          /* ⭐⭐ 自动回话（2026-10-25 使用者反馈「我回它私信它不回我」）：
+           *   新消息进来 ⇒ 插件自己起一轮去读会话、按人设回一句（带称呼）。
+           *   以前只有「看见 + 提醒」，回话要靠用户主动跟 AI 说话才会发生。 */
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '自动回话'),
+              h('div', { 'data-dy-sub': '' },
+                (cfg.chatAutoReply !== false
+                  ? '✅ 开着：老大发消息进来 ⇒ 大肥鱼自己起一轮去读会话、回他一句（连发几条只会回一次，夜里也回）。'
+                  : '关着：只盯消息不自动回（回话要靠你主动跟大肥鱼说话）。'))),
+            h(Switch, {
+              on: cfg.chatAutoReply !== false,
+              disabled: !cfg.dmToId || busy === 'patch',
+              onChange: (v) => patch({ chatAutoReply: v }, v
+                ? '✅ 已打开自动回话'
+                : '已关闭自动回话'),
             })),
           busy === 'patch'
             ? h('div', { 'data-dy-sub': '' }, '保存中…')
@@ -861,8 +955,8 @@ window.__ModuleLoader__.load({
             : null,
           /* ⭐ 实时状态屏（2026-10-24 使用者要求：「我哪知道它有什么用、错在哪了」）：
            *    开着聊天模式时每 15 秒拉一次后端状态，显示几秒前看过、结果、通知弹没弹。 */
-          cfg.chatWatch ? h(ChatWatchStatus, { key: 'cw-status' }) : null),
-
+          cfg.chatWatch ? h(ChatWatchStatus, { key: 'cw-status' }) : null)
+        ]),h('div', { 'data-dy-tab': 'fish', style: { display: tab === 'fish' ? 'contents' : 'none' } }, [
         /* ── 🐟 大肥鱼自主行为（2026-10-24）：自己刷、自己学、自己表达 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '🐟 大肥鱼自主行为'),
@@ -881,7 +975,7 @@ window.__ModuleLoader__.load({
             cfg.shareToOwner,
             { disabled: !cfg.autoSend || !cfg.dmToId, onLabel: '✅ 已打开私信分享', offLabel: '已关闭私信分享' }),
           !cfg.dmToId ? h('div', { 'data-dy-sub': '' }, '（先在下面「私信发给谁」选好老大主号）') : null,
-          engNum('sharePerDay', '每天最多分享给老大几条（0–30，0=关）', 0, 30, (n) => `每天最多分享 ${n} 条`),
+          h('div', { 'data-dy-sub': '' }, '分享条数：不设上限 —— 发几条由大肥鱼自己判断（真心想安利就发，宁缺勿滥，不为凑数硬发、也不为控数忍着）。'),
 
           h('div', { style: { height: '8px' } }),
           engToggle('proactiveComment', '② 主动评论（不是每条都评）',
@@ -890,17 +984,18 @@ window.__ModuleLoader__.load({
               : '关着（默认，推荐）：不主动发公开评论。',
             cfg.proactiveComment,
             { disabled: !cfg.autoSend, onLabel: '✅ 已打开主动评论', offLabel: '已关闭主动评论' }),
-          engNum('proactiveCommentPerDay', '每天最多主动评论几条（0–30，0=关）', 0, 30, (n) => `每天最多主动评论 ${n} 条`),
+          engNum('proactiveCommentPerDay', '每天最多主动评论几条（0 = 不限；2026-10-25 取消上限）', 0, 30, (n) => (n === 0 ? '主动评论：不限' : `每天最多主动评论 ${n} 条`)),
 
           h('div', { style: { height: '8px' } }),
           engToggle('autoReply', '③ 自动回复别人对我的评论',
             cfg.autoReply
-              ? '✅ 开着：只回善意、好回答的，同一个人每天最多回设定次数（默认 2）。'
+              ? '✅ 开着：只回善意、好回答的；总条数不限，**同一个人最多回 2 次**（2026-10-27 老大定的）；'
+                + '可以回多个人，但不强制每个人都回 —— 谁值得回由大肥鱼自己判断。'
               : '关着（默认，推荐）：不回评论区里的人。',
             cfg.autoReply,
             { disabled: !cfg.autoSend, onLabel: '✅ 已打开自动回复', offLabel: '已关闭自动回复' }),
-          engNum('replyPerDay', '每天最多回复几条（0–60，0=关）', 0, 60, (n) => `每天最多回复 ${n} 条`),
-          engNum('replyPerPerson', '同一个人每天最多回几次（0–10，建议 2）', 0, 10, (n) => `同一个人每天最多回 ${n} 次`),
+          engNum('replyPerDay', '每天最多回复几条（0 = 不限；2026-10-25 取消上限）', 0, 60, (n) => (n === 0 ? '自动回复：不限' : `每天最多回复 ${n} 条`)),
+          engNum('replyPerPerson', '同一个人每天最多回几次（默认 2；0 = 不限）', 0, 10, (n) => (n === 0 ? '同一个人：不限' : `同一个人每天最多回 ${n} 次`)),
           engToggle('replyKindOnly', '只回善意 / 好回答的评论',
             cfg.replyKindOnly
               ? '✅ 开着：恶意、辱骂、抬杠、引战、引流、索要隐私一律不回。'
@@ -908,8 +1003,8 @@ window.__ModuleLoader__.load({
             cfg.replyKindOnly,
             { disabled: !cfg.autoSend || !cfg.autoReply, onLabel: '✅ 已开启善意过滤', offLabel: '已关闭善意过滤' }),
           h('div', { 'data-dy-sub': '', style: { marginTop: '6px', opacity: '.78' } },
-            '④ 在评论区 @ 老大：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。')),
-
+            '④ 在评论区 @ 老大：在上面「自动发送」卡片里的「在评论区 @ 你」开关控制（只在最值得的一条发）。'))
+        ]),h('div', { 'data-dy-tab': 'fish', style: { display: tab === 'fish' ? 'contents' : 'none' } }, [
         /* ── 👀 看画面（v0.3.9）+ 自适应抽帧 / 语音（v0.4.0） ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '👀 让大肥鱼看视频画面、听台词'),
@@ -934,8 +1029,8 @@ window.__ModuleLoader__.load({
               ? '✅ 开着：无字幕视频会用本地 faster-whisper 转写（CPU 较慢、首次下载模型；需 pip install faster-whisper）。'
               : '关着（推荐）：只用官方字幕，没字幕就老实标注「无台词」，不假装听懂。',
             cfg.useAsr, { onLabel: '✅ 已开启本地 Whisper', offLabel: '已关闭本地 Whisper（默认）' }),
-          engNum('spokenMaxChars', '每条台词最多保留多少字（0–2000，默认 600，控 token）', 0, 2000, (n) => `台词最多 ${n} 字`)),
-
+          engNum('spokenMaxChars', '每条台词最多保留多少字（0–2000，默认 600，控 token）', 0, 2000, (n) => `台词最多 ${n} 字`))
+        ]),h('div', { 'data-dy-tab': 'fish', style: { display: tab === 'fish' ? 'contents' : 'none' } }, [
         /* ── 🐟 表情包（v0.4.0）：收集 + 安全审核 + 发表 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '🐟 表情包（自己收集 · 安全审核后再发）'),
@@ -952,8 +1047,10 @@ window.__ModuleLoader__.load({
           engToggle('stickerSafeOnly', '只发审核通过的安全表情（强烈建议开）',
             cfg.stickerSafeOnly !== false ? '✅ 开着：只有审核通过的表情才发得出去。' : '⚠️ 关着：待审表情也可能被发（不建议）。',
             cfg.stickerSafeOnly !== false, { onLabel: '✅ 已锁定只发安全表情', offLabel: '⚠️ 未锁定安全表情' }),
-          engNum('stickerPerDay', '每天最多发几个表情（0–30，默认 5）', 0, 30, (n) => `每天最多 ${n} 个表情`)),
-
+          engNum('stickerPerDay', '每天最多发几个表情（0 = 不限，默认不限）', 0, 30, (n) => (n === 0 ? '表情数量：不限（由大肥鱼自己判断）' : `每天最多 ${n} 个表情`)),
+          engNum('shareDmPerDay', '私信分享给老大：每天最多几条（0 = 不限）', 0, 100, (n) => (n === 0 ? '私信分享：不限' : `私信分享：每天最多 ${n} 条`)),
+          engNum('shareMentionPerDay', '评论区 @ 老大：每天最多几条（0 = 不限，与私信分开算）', 0, 100, (n) => (n === 0 ? '评论区 @ 老大：不限' : `评论区 @ 老大：每天最多 ${n} 条`)))
+        ]),h('div', { 'data-dy-tab': 'fish', style: { display: tab === 'fish' ? 'contents' : 'none' } }, [
         /* ── 🛡️ 降风险控（v0.3.9）：拟人节奏 / 夜间静默 / 上限 / 养号 / 熔断 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '🛡️ 降风险控（防封号）'),
@@ -992,13 +1089,13 @@ window.__ModuleLoader__.load({
             cfg.safeQuiet, { onLabel: '✅ 已打开夜间静默', offLabel: '已关闭夜间静默' }),
           engText('quietStart', '夜间开始（HH:MM）', '23:00', (v) => `夜间静默从 ${v} 开始`),
           engText('quietEnd', '夜间结束（HH:MM）', '08:00', (v) => `夜间静默到 ${v} 结束`),
-          engNum('maxActionsPerHour', '每小时对外动作上限（1–30，默认 8）', 1, 30, (n) => `每小时最多 ${n} 个动作`),
-          engNum('maxActionsPerDay', '每天对外动作上限（1–100，默认 20）', 1, 100, (n) => `每天最多 ${n} 个动作`),
+          engNum('maxActionsPerHour', '每小时对外动作上限（默认 100；只有前 3 天真的卡）', 1, 1000, (n) => `每小时最多 ${n} 个动作`),
+          engNum('maxActionsPerDay', '每天对外动作上限（默认 260；只有前 3 天真的卡，之后不限）', 1, 2000, (n) => `每天最多 ${n} 个动作`),
           engToggle('nurtureMode', '新号养号期（前几天自动减半、拉长间隔）',
-            cfg.nurtureMode ? `✅ 开着：新号前 ${cfg.nurtureDays ?? 7} 天更克制。` : '关着：新号一上来就按正常频率（不建议）。',
+            cfg.nurtureMode ? `✅ 开着：新号前 ${cfg.nurtureDays ?? 3} 天更克制，3 天后自动放开。` : '关着：新号一上来就按正常频率（不建议）。',
             cfg.nurtureMode, { onLabel: '✅ 已打开养号期', offLabel: '已关闭养号期' }),
-          engNum('nurtureDays', '养号期天数（0–30，默认 7）', 0, 30, (n) => `养号 ${n} 天`)),
-
+          engNum('nurtureDays', '养号期天数（默认 3；这几天里上面的上限才生效）', 0, 30, (n) => `养号 ${n} 天`))
+        ]),h('div', { 'data-dy-tab': 'basic', style: { display: tab === 'basic' ? 'contents' : 'none' } }, [
         /* ── 开始使用：三步装机 + 扫码登录 ──
          * 🔴 2026-10-22：以前这里只写一句「命令行跑 node tools/qr-login.mjs start」——
          *    对新手等于"你自己去折腾"。现在做成**点按钮 → 出二维码 → 手机扫 → 点我扫完了**。
@@ -1056,8 +1153,8 @@ window.__ModuleLoader__.load({
                     '扫完如果抖音还弹「短信验证码」或「拖动滑块」—— 在那个弹出的浏览器窗口里做完，再点「我扫完了」。不用重新扫。'))
                 : h('div', { 'data-dy-sub': '' },
                   qrHint || '点上面的「扫码登录」，会弹出一个浏览器窗口显示二维码，手机扫一下就行。'))
-            : null),
-
+            : null)
+        ]),h('div', { 'data-dy-tab': 'basic', style: { display: tab === 'basic' ? 'contents' : 'none' } }, [
         /* ── 环境体检 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1105,8 +1202,8 @@ window.__ModuleLoader__.load({
             }, '自动找')),
           h('div', { 'data-dy-sub': '', style: { opacity: '.78' } },
             '填这两个之一：<安装目录>\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\'
-            + 'dsh-desktop-host\\lib\\cli.js 或 …\\@deepseek-ai\\dsh\\lib\\bin.js')),
-
+            + 'dsh-desktop-host\\lib\\cli.js 或 …\\@deepseek-ai\\dsh\\lib\\bin.js'))
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
         /* ── 私信发给谁（点选，不用手填 sec_uid） ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1177,12 +1274,35 @@ window.__ModuleLoader__.load({
                   },
                 }, '保存'),
                 h('div', { 'data-dy-sub': '' }, '留空 = 不发私信，只写日报')))
-            : null),
+            : null,
 
+          /* ⭐ 2026-10-25 使用者要求：所有发出去的正文都带称呼（「老大，……」） */
+          h('div', { 'data-dy-row': '', style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08))' } },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '对老大的称呼'),
+              h('div', { 'data-dy-sub': '' },
+                '回复 / 评论 / 私信里会带上「' + (String(cfg.ownerTitle || '').trim() || '老大') + '」这个称呼，位置由大肥鱼按内容自己安排（不必固定放开头；留空 = 不叫称呼）'))),
+            h('input', {
+              'data-dy-input': '', style: { width: '100px' }, type: 'text', placeholder: '老大',
+              value: engDraft.ownerTitle !== undefined ? engDraft.ownerTitle : String(cfg.ownerTitle ?? '老大'),
+              onChange: (e) => setEngDraft({ ...engDraft, ownerTitle: e.target.value }),
+            }),
+            h('button', {
+              'data-dy-mini': '', disabled: engDraft.ownerTitle === undefined || busy === 'patch',
+              onClick: async () => {
+                await patch({ ownerTitle: String(engDraft.ownerTitle || '').trim() }, '称呼已保存')
+                setEngDraft({ ...engDraft, ownerTitle: undefined })
+              },
+            }, '保存'))
+        ]),h('div', { 'data-dy-tab': 'feed', style: { display: tab === 'feed' ? 'contents' : 'none' } }, [
         /* ── 刷什么 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '刷什么'),
           h('div', { 'data-dy-sub': '' }, '关注关键词，一行一个（留空 = 用内置默认那几组）'),
+          h('div', { 'data-dy-sub': '', style: { opacity: '.78' } },
+            '⭐ 顺序 = 权重（第 1 个 1.00，相邻最多差 0.15，最低 0.25）；'
+            + '但**每轮是随机抽 6 个**去搜，所有关键词都会轮到，高权重的只是概率略高一点。'
+            + '（2026-10-25 改：以前只取前 6 个，后面的词根本不刷。）'),
           h('textarea', {
             'data-dy-input': '', rows: 5, value: kwText,
             placeholder: '搞笑\n美食\n猫',
@@ -1192,22 +1312,22 @@ window.__ModuleLoader__.load({
             h('button', {
               'data-dy-btn': '', 'data-primary': '',
               disabled: Boolean(busy), onClick: saveKws,
-            }, '保存'))),
-
+            }, '保存')))
+        ]),h('div', { 'data-dy-tab': 'feed', style: { display: tab === 'feed' ? 'contents' : 'none' } }, [
         /* ── 什么时候跑 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
             h('div', { 'data-dy-grow': '' },
               h('div', { 'data-dy-title': '' }, '什么时候自己跑'),
-              h('div', { 'data-dy-sub': '' }, '只在谷时跑（便宜）。全关 = 只在你点「现在跑一轮」时跑。'))),
+              h('div', { 'data-dy-sub': '' }, '只在谷时跑（便宜）。默认 08:00–23:55 自动跑，时段可调；全关 = 只在你点「现在跑一轮」时跑。'))),
           h('div', { 'data-dy-row': '' },
-            h('div', { 'data-dy-grow': '' }, h('div', { 'data-dy-sub': '' }, '中午谷时 12:00–14:00')),
+            h('div', { 'data-dy-grow': '' }, h('div', { 'data-dy-sub': '' }, '中午谷时 12:00–14:00（默认关：已含在白天窗口里）')),
             h(Switch, {
               on: Boolean(cfg.noon),
               onChange: (v) => patch({ noon: v }, v ? '中午自动跑：开' : '中午自动跑：关'),
             })),
           h('div', { 'data-dy-row': '' },
-            h('div', { 'data-dy-grow': '' }, h('div', { 'data-dy-sub': '' }, '晚上谷时 18:00–次日 09:00')),
+            h('div', { 'data-dy-grow': '' }, h('div', { 'data-dy-sub': '' }, '白天谷时 08:00–23:55（默认开）')),
             h(Switch, {
               on: Boolean(cfg.night),
               onChange: (v) => patch({ night: v }, v ? '晚上自动跑：开' : '晚上自动跑：关'),
@@ -1246,18 +1366,18 @@ window.__ModuleLoader__.load({
               ? h('span', { 'data-dy-sub': '' }, '跨零点也行（23:00 → 02:00）')
               : null),
 
-          h('div', { 'data-dy-sub': '' }, '两个都关 = 只在点「现在跑一轮」时跑。')),
-
+          h('div', { 'data-dy-sub': '' }, '两个都关 = 只在点「现在跑一轮」时跑。'))
+        ]),h('div', { 'data-dy-tab': 'feed', style: { display: tab === 'feed' ? 'contents' : 'none' } }, [
         /* ── 每天挑几条 / 日报多细 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-title': '' }, '每天挑几条'),
           h('div', { 'data-dy-sub': '' },
-            '全天总量（不是每轮）。0 = 不自动刷，只在你点「现在跑一轮」时跑。'),
+            '全天总量（不是每轮）。**默认 100，没有上限**（想挑多少就填多少）。0 = 不自动刷，只在你点「现在跑一轮」时跑。'),
           h('div', { 'data-dy-row': '' },
             h('input', {
-              'data-dy-time': '', type: 'number', min: 0, max: 300,
+              'data-dy-time': '', type: 'number', min: 0, max: 100000,
               style: { width: '72px' },
-              value: String(perDayDraft !== null ? perDayDraft : (cfg.perDay != null ? cfg.perDay : 5)),
+              value: String(perDayDraft !== null ? perDayDraft : (cfg.perDay != null ? cfg.perDay : 100)),
               onChange: (e) => setPerDayDraft(e.target.value),
             }),
             h('span', { 'data-dy-sub': '' }, '条 / 天'),
@@ -1266,7 +1386,7 @@ window.__ModuleLoader__.load({
               'data-dy-mini': '', 'data-primary': '',
               disabled: Boolean(busy) || perDayDraft === null,
               onClick: async () => {
-                const n = Math.max(0, Math.min(Number(perDayDraft) || 0, 300))
+                const n = Math.max(0, Math.min(Number(perDayDraft) || 0, 100000))
                 await patch({ perDay: n }, `每天最多 ${n} 条`)
                 setPerDayDraft(null)
               },
@@ -1275,16 +1395,16 @@ window.__ModuleLoader__.load({
             h('input', {
               'data-dy-time': '', type: 'number', min: 1, max: 30,
               style: { width: '72px' },
-              value: String(maxPerRunDraft !== null ? maxPerRunDraft : (cfg.maxPerRun != null ? cfg.maxPerRun : 12)),
+              value: String(maxPerRunDraft !== null ? maxPerRunDraft : (cfg.maxPerRun != null ? cfg.maxPerRun : 20)),
               onChange: (e) => setMaxPerRunDraft(e.target.value),
             }),
-            h('span', { 'data-dy-sub': '' }, '条 / 轮（每轮最多刷几条、抓几条约画面，1–30，默认 12）'),
+            h('span', { 'data-dy-sub': '' }, '条 / 轮（每轮最多刷几条、抓几条约画面，1–30，默认 20）'),
             h('div', { 'data-dy-grow': '' }),
             h('button', {
               'data-dy-mini': '', 'data-primary': '',
               disabled: Boolean(busy) || maxPerRunDraft === null,
               onClick: async () => {
-                const n = Math.max(1, Math.min(Number(maxPerRunDraft) || 12, 30))
+                const n = Math.max(1, Math.min(Number(maxPerRunDraft) || 20, 30))
                 await patch({ maxPerRun: n }, `每轮最多刷 ${n} 条`)
                 setMaxPerRunDraft(null)
               },
@@ -1309,8 +1429,8 @@ window.__ModuleLoader__.load({
               h('option', { value: 'toast' }, '弹 Windows 通知'),
               h('option', { value: 'file' }, '只写文件（不打扰）'),
               h('option', { value: 'webhook' }, '推 webhook'),
-              h('option', { value: 'both' }, '通知 + webhook')))),
-
+              h('option', { value: 'both' }, '通知 + webhook'))))
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
         /* ── 消息：评论区 @ 我 + 谁私信我 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1364,8 +1484,8 @@ window.__ModuleLoader__.load({
             : null,
           inbox !== null && !inbox.ok
             ? h('div', { 'data-dy-msg': '', 'data-warn': '' }, (inbox.errors || []).join('；') || '读不到消息')
-            : null),
-
+            : null)
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
         /* ── 聊天（带记忆） ── */
         chat !== null
           ? h('div', { 'data-dy-card': '' },
@@ -1405,8 +1525,8 @@ window.__ModuleLoader__.load({
               }, busy === 'send' ? '发送中…' : '发送')),
             h('div', { 'data-dy-sub': '' },
               '发出去的话会记进记忆，下次打开就知道聊到哪了。'))
-          : null,
-
+          : null
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
         /* ── 对话记忆 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1430,8 +1550,27 @@ window.__ModuleLoader__.load({
                   'data-dy-mini': '', 'data-danger': '', disabled: Boolean(busy) || (!mem.dm && !mem.comment),
                   onClick: clearMem,
                 }, '清空全部记忆')))
-            : null),
-
+            : null)
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
+        /* ── 🌱 自主生活 & 记忆（2026-10-27 老大要求） ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-title': '' }, '🌱 自主生活 & 记忆'),
+          h('div', { 'data-dy-sub': '' },
+            '它有自己的生活：累了想休息、你很久没回会想你，会自己说一句；也记得你们约过什么、答应过什么。'
+            + '（发不发由它自己判断，这里只是给它机会和护栏。）'),
+          engToggle('lifeTick', '让它有自己的生活（不定时主动说话）',
+            cfg.lifeTick !== false
+              ? '✅ 开着：隔一段时间给它一次「想不想说句话」的机会，发不发由它自己定。'
+              : '关着：它只在你说话时才开口。',
+            cfg.lifeTick !== false, { onLabel: '✅ 允许它过自己的生活', offLabel: '关掉了：只在你说话时开口' }),
+          engNum('lifeGapMin', '两次主动之间至少隔多少分钟（默认 180）', 30, 720, (n) => `至少隔 ${n} 分钟`),
+          engNum('lifePerDay', '每天最多主动说几次（默认 3；0 = 不限）', 0, 20, (n) => (n === 0 ? '主动说话：不限' : `每天最多 ${n} 次`)),
+          engToggle('notesDigest', '每天整理一次「记忆档案」（约定 / 答应过的事，带日期）',
+            cfg.notesDigest !== false
+              ? '✅ 开着：每天把对话浓缩进 memory/notes-<人>.md，问「昨天你答应我什么」就答得上。'
+              : '关着：只留原始对话（问久一点的事容易答不上）。',
+            cfg.notesDigest !== false, { onLabel: '✅ 每天整理记忆', offLabel: '关了：不整理记忆档案' }))
+        ]),h('div', { 'data-dy-tab': 'chat', style: { display: tab === 'chat' ? 'contents' : 'none' } }, [
         /* ── 我的人设 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1461,9 +1600,109 @@ window.__ModuleLoader__.load({
                 }, '填入默认那份看看'),
                 h('div', { 'data-dy-grow': '' }),
                 h('span', { 'data-dy-sub': '' }, '留空保存 = 退回默认')))
-            : null),
+            : null)
+        ]),h('div', { 'data-dy-tab': 'grow', style: { display: tab === 'grow' ? 'contents' : 'none' } }, [
+        /* ── 成长：它是谁（画像）+ 每天学到什么（日记）（2026-10-25 老大要求） ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '🐟 大肥鱼在想什么'),
+              h('div', { 'data-dy-sub': '' },
+                growth === null
+                  ? '它自己刷出来的认知、审美和每天学到的东西 —— 点开看看它脑子里在长什么'
+                  : '这些全是它自己写的：画像在 portrait.md，日记在 diary\\<日期>.md')),
+            h('button', {
+              'data-dy-btn': '', disabled: busy === 'growth',
+              onClick: () => loadGrowth(growthDay),
+            }, busy === 'growth' ? '翻着呢…' : (growth === null ? '看看它' : '刷新'))),
 
-        /* ── 给别的 AI 用（MCP） ── */
+          growth === null
+            ? null
+            : [
+              h('div', { 'data-dy-title': '' }, '它是谁 · 画像'),
+              growth.portrait_exists
+                ? h('pre', { 'data-dy-pre': '' }, growth.portrait)
+                : h('div', { 'data-dy-sub': '' }, growth.hint || '还没写 —— 跑几轮之后它自己会写'),
+
+              growth.tastes && growth.tastes.count
+                ? h('div', { 'data-dy-kv': '' },
+                  `口味观察已攒 ${growth.tastes.count} 条`
+                  + (growth.tastes.kinds && growth.tastes.kinds.length
+                    ? '　·　偏好类型：' + growth.tastes.kinds.map((x) => `${x.name}×${x.n}`).join('、')
+                    : '')
+                  + (growth.tastes.tags && growth.tastes.tags.length
+                    ? '　·　常停留标签：' + growth.tastes.tags.map((x) => `${x.name}×${x.n}`).join('、')
+                    : ''),
+                  growth.tastes.authors && growth.tastes.authors.length
+                    ? h('div', { style: { marginTop: '4px' } }, '常看的作者：' + growth.tastes.authors.map((x) => `${x.name}×${x.n}`).join('、'))
+                    : null)
+                : h('div', { 'data-dy-sub': '' }, '口味画像还空着 —— 它遇到真心喜欢的东西时才会记一笔'),
+
+              h('div', { 'data-dy-row': '', style: { marginTop: '10px' } },
+                h('div', { 'data-dy-grow': '' },
+                  h('div', { 'data-dy-title': '' }, '这一天的日记'),
+                  h('div', { 'data-dy-sub': '' }, growth.day || ''),
+                  h('div', { 'data-dy-sub': '' }, '日记写在**当天收工**的时候：到点（默认 23:55）或把当天该刷的刷完，满足其一就写一次。')),
+                h('div', { 'data-dy-row': '' },
+                  h('button', {
+                    'data-dy-mini': '', disabled: busy === 'growthWrite',
+                    onClick: () => writeDiary(growth.day),
+                  }, busy === 'growthWrite' ? '叫它写…' : '补写这天'),
+                  (growth.days || []).length > 1
+                    ? h('select', {
+                      'data-dy-time': '',
+                      value: growthDay || (growth.day || ''),
+                      onChange: (e) => loadGrowth(e.target.value),
+                    }, (growth.days || []).map((d) => h('option', { value: d }, d)))
+                    : null)),
+              growth.diary_exists
+                ? h('pre', { 'data-dy-pre': '' }, growth.diary)
+                : h('div', { 'data-dy-sub': '' }, '这天还没写日记 —— 收工时它自己会写；等不及就点上面「补写这天」'),
+            ])
+        ]),h('div', { 'data-dy-tab': 'mood', style: { display: tab === 'mood' ? 'contents' : 'none' } }, [
+        /* ── 情绪（2026-10-28）：现在什么心情、今天整体、最近轨迹。不设档位，外放由它自己定。 ── */
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '🌡 大肥鱼现在的心情'),
+              h('div', { 'data-dy-sub': '' },
+                '心情不是开关：它由真实事件推着走（看到什么、评论区怎样、老大来没来），有惯性也会慢慢回落。'
+                + '这里只能看，不能调 —— 外放多少由它自己按场合决定。'),
+              mood
+                ? h('div', {},
+                  h('div', { 'data-dy-kv': '' },
+                    h('span', { 'data-dy-k': '' }, '此刻'),
+                    h('span', { 'data-dy-v': '' }, String(mood.label || '—')
+                      + '（好感 ' + Number(mood.v ?? 0).toFixed(2) + ' / 兴奋 ' + Number(mood.a ?? 0).toFixed(2) + '）')),
+                  h('div', { 'data-dy-sub': '' }, '因为：' + String(mood.why || '—')),
+                  h('div', { 'data-dy-sub': '' }, '今天：' + String(mood.today || '—')),
+                  h('div', { 'data-dy-sub': '' },
+                    '它养出来的说话习惯：外放 ' + Number((mood.habit && mood.habit.outward) || 0).toFixed(2) + '（0 内敛 ~ 1 外放；这是它自己的倾向，不是设定）'),
+                  h('div', { 'data-dy-grow': '' }),
+                  h('div', { 'data-dy-title': '' }, '🕘 最近的心情轨迹'),
+                  h('pre', { 'data-dy-pre': '' }, String(mood.trail_text || '还没有轨迹 —— 等它刷一轮、或者老大来找它，就会开始记')
+                    + '\n\n' + String(mood.files ? '' : '')),
+                )
+                : h('div', { 'data-dy-sub': '' }, '还没读到情绪数据 —— 点右边「刷新」再看'),
+            ),
+            h('button', { 'data-dy-mini': '', disabled: busy === 'mood', onClick: () => loadMood() }, '刷新'),
+          )),
+        h('div', { 'data-dy-card': '' },
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '🧭 它怎么被推着走'),
+              h('div', { 'data-dy-sub': '' },
+                '· 看到好笑/可爱/离谱/治愈/无聊/吓人 → 心情跟着动（同类连着来会递减：看多了会腻）。'
+                + '\n· 评论区被善意回、被夸、被抬杠；老大来了、老大很久没来 → 都在记账。'
+                + '\n· 深夜会犯困、刷久了会疲、连着看同类会腻。'
+                + '\n· 有惯性：上一条的情绪会带进下一条；强情绪落得慢，轻情绪一会儿就回去了。'
+                + '\n· 允许矛盾：又好笑又心疼、嘴上嫌弃手里收藏。'),
+              h('div', { 'data-dy-sub': '' },
+                '情绪只改「怎么说」，不改「做什么」：该评论照样评论，该回话照样回话；'
+                + '但再激动也不刷屏、不挑衅、不辱骂，讲正事时情绪让位。'),
+            ),
+          )),
+        ]),h('div', { 'data-dy-tab': 'adv', style: { display: tab === 'adv' ? 'contents' : 'none' } }, [
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
             h('div', { 'data-dy-grow': '' },
@@ -1500,8 +1739,8 @@ window.__ModuleLoader__.load({
                     onClick: () => copy(ai.doc, '使用说明'),
                   }, copied === '使用说明' ? '✓ 已复制' : '复制完整使用说明（贴给那个 AI 看）'))
                 : h('div', { 'data-dy-msg': '', 'data-warn': '' }, '读不到 AI-USAGE.md：' + (ai.doc_error || '未知原因')))
-            : h('div', { 'data-dy-sub': '' }, '点「看接入方式」会显示：MCP 配置、自测命令、给 AI 看的使用说明。')),
-
+            : h('div', { 'data-dy-sub': '' }, '点「看接入方式」会显示：MCP 配置、自测命令、给 AI 看的使用说明。'))
+        ]),h('div', { 'data-dy-tab': 'adv', style: { display: tab === 'adv' ? 'contents' : 'none' } }, [
         /* ── 关于 / 检查更新 ── */
         h('div', { 'data-dy-card': '' },
           h('div', { 'data-dy-row': '' },
@@ -1522,15 +1761,15 @@ window.__ModuleLoader__.load({
             : null,
           upd && upd.tried && !upd.checked
             ? h('div', { 'data-dy-sub': '' }, '试过：' + upd.tried.map((t) => t.source + (t.ok ? ' ✓' : ' ✗')).join('、'))
-            : null),
-
+            : null)
+        ]),h('div', { 'data-dy-tab': 'adv', style: { display: tab === 'adv' ? 'contents' : 'none' } }, [
         /* ── 报告 ── */
         report !== null
           ? h('div', { 'data-dy-card': '' },
             h('div', { 'data-dy-title': '' }, '报告'),
             h('pre', { 'data-dy-pre': '' }, report))
-          : null,
-      )
+          : null
+        ]),)
     }
 
     return {

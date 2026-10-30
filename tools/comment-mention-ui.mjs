@@ -19,6 +19,7 @@
  *
  * --dry：点选完人 + 补完正文就停，不发布；会 dump 弹层行数据和编辑器 HTML。
  */
+import { writeFileSync } from 'node:fs'
 import { openPage, sleep } from '../lib/chrome.mjs'
 
 const argv = process.argv.slice(2)
@@ -378,13 +379,157 @@ try {
     return '{}';
   })()`))
   if (!btn.x) { out({ ok: false, error: '找不到发布箭头', editor_html: editorHtml }); process.exit(1) }
-  await click(btn.x, btn.y)
-  await sleep(4000)
 
-  const editorAfter = await c.ev(`(function(){ var e=document.querySelector('.public-DraftEditor-content'); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
+  /**
+   * ⭐ 2026-10-25：钩住 `/comment/publish` 的响应。
+   *    以前这条路径只报「点到了发布箭头上」就当成功 —— 实测评论数根本不变（服务端没收录），
+   *    老大那边当然收不到 @ 通知。现在把服务端真正返回的 status_code / cid 抓回来，
+   *    拿不到、或 status_code != 0、或输入框没被清空，都**不再**报 published。
+   */
+  await c.ev(`(function(){
+    if (window.__dyPub) return;
+    window.__dyPub = [];
+    var of = window.fetch;
+    window.fetch = function(input, init){
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      var p = of.apply(this, arguments);
+      if (url.indexOf('comment/publish') >= 0) {
+        p.then(function(r){
+          try { r.clone().text().then(function(t){ window.__dyPub.push({ via:'fetch', status: r.status, body: String(t||'').slice(0,2000) }) }, function(){}); } catch(e){}
+        }, function(e){ window.__dyPub.push({ via:'fetch', error: String(e && e.message || e) }) });
+      }
+      return p;
+    };
+    var op = XMLHttpRequest.prototype.open, se = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; return op.apply(this, arguments) };
+    XMLHttpRequest.prototype.send = function(){
+      var x = this;
+      if (String(x.__u || '').indexOf('comment/publish') >= 0) {
+        x.addEventListener('loadend', function(){ try { window.__dyPub.push({ via:'xhr', status: x.status, body: String(x.responseText||'').slice(0,2000) }) } catch(e){} });
+      }
+      return se.apply(this, arguments);
+    };
+  })()`)
+
+  await click(btn.x, btn.y)
+  /* ⭐ 调试：点完把屏幕留下来（DOUYIN_SHOT=<png>），看是不是弹了验证/提示 */
+  if (process.env.DOUYIN_SHOT) {
+    try {
+      const shot = await c.send('Page.captureScreenshot', { format: 'png' })
+      if (shot && shot.data) writeFileSync(process.env.DOUYIN_SHOT, Buffer.from(shot.data, 'base64'))
+    } catch { /* 截图失败不影响主流程 */ }
+  }
+  await sleep(4500)
+
+  const pubs = JSON.parse(String(await c.ev(`JSON.stringify(window.__dyPub || [])`)) || '[]')
+  const lastPub = pubs[pubs.length - 1] || {}
+  let sc = null
+  let cid = ''
+  let serverMsg = ''
+  try {
+    const j = JSON.parse(String(lastPub.body || '{}'))
+    sc = (j.status_code === undefined ? null : Number(j.status_code))
+    cid = String((j.comment && j.comment.cid) || '')
+    serverMsg = String(j.status_msg || j.statusMsg || '').slice(0, 120)
+  } catch { /* 响应不是 JSON */ }
+
+  /* ⭐ 2026-10-27：真实鼠标点坐标有时打不中那个箭头（React 的 hit 区域比 svg 大，或 svg 只是图标），
+     实测截图里输入框还原样留着、箭头还亮着 ⇒ 补一次「JS 直接 click 祖先」的兜底，再验一次。 */
+  let editorAfter = await c.ev(`(function(){ var e=document.querySelector('.public-DraftEditor-content'); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
+  let jsClicked = false
+  if (String(editorAfter || '').trim() !== '' && editorAfter !== '(gone)') {
+    jsClicked = Boolean(await c.ev(`(function(){
+      var root=document.getElementById('comment-input-container');
+      if(!root) return false;
+      var svgs=root.querySelectorAll('svg');
+      for (var i=0;i<svgs.length;i++){
+        if (String(svgs[i].innerHTML||'').indexOf('FE2C55')<0) continue;
+        var e=svgs[i];
+        for (var up=0; up<5 && e; up++){ try { e.click() } catch(_){} ; e=e.parentElement }
+        return true;
+      }
+      return false;
+    })()`))
+    if (jsClicked) await sleep(3500)
+    editorAfter = await c.ev(`(function(){ var e=document.querySelector('.public-DraftEditor-content'); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
+    /* ⭐ 兜底二：评论区通常 Enter 也能发（前端 onKeyDown 里 send） */
+    if (String(editorAfter || '').trim() !== '' && editorAfter !== '(gone)') {
+      await c.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+      await c.send('Input.dispatchKeyEvent', { type: 'char', text: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+      await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+      await sleep(3500)
+    }
+    editorAfter = await c.ev(`(function(){ var e=document.querySelector('.public-DraftEditor-content'); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
+  }
+  /* ⭐ 2026-10-27 真因：点发布会弹「接收短信验证码 —— 为确保是本人操作抖音账号…」。
+     没过验证前 /comment/publish 只回 200 空 body、输入框不清空 ⇒ 以前一律误判成"服务端没收录"。
+     这里明确把「要过短信验证」报出来，上层好提示老大跑一次 tools/comment-verify.mjs。 */
+  const verifyState = JSON.parse(String(await c.ev(`(function(){
+    var t = String(document.body.innerText || '');
+    var need = t.indexOf('接收短信验证码') >= 0 || t.indexOf('为确保是本人操作') >= 0;
+    var m = t.match(/手机号\\s*(1\\d{2}\\*+\\d{2,4})/);
+    return JSON.stringify({ need: need, phone: m ? m[1] : '' });
+  })()`)) || '{}')
+  const cleared = editorAfter === '(gone)' || String(editorAfter).trim() === ''
+  /* ⭐ 2026-10-27：发成功后**回头找 cid**（UI 路径本身拿不到，但评论已经入库了）。
+     有了 cid 就能删、能回读 text_extra 确认 mention 到底保没保住 —— 这才是"真 @ 上"的硬证据。 */
+  let found = {}
+  if (cleared) {
+    const needle = JSON.stringify(String(TEXT || '').replace(/^@\S+\s+/, '').slice(-16))
+    const findOnce = async () => JSON.parse(String(await c.ev(`(async function(){
+        var needle=${needle};
+        var norm=function(s){ return String(s||'').replace(/\\s+/g,'') };
+        var n=norm(needle); if(!n) return '{}';
+        var cursor=0, pages=0;
+        while (pages<3) {
+          var u='/aweme/v1/web/comment/list/?aweme_id=${AWEME}&cursor='+cursor+'&count=50&item_type=0&insert_ids=&whale_cut_token=&cut_version=1&rcFT=';
+          var j=await (await fetch(u,{credentials:'include'})).json();
+          var cs=(j&&j.comments)||[];
+          for (var i=0;i<cs.length;i++){
+            var t=norm(cs[i].text);
+            if (t.indexOf(n)>=0) return JSON.stringify({ cid:String(cs[i].cid||''), text:String(cs[i].text||'').slice(0,140), text_extra: cs[i].text_extra||[] });
+          }
+          pages++; cursor=(j&&j.cursor)||0; if(!(j&&j.has_more)||!cursor) break;
+        }
+        return '{}';
+      })()`)) || '{}')
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try { found = await findOnce() } catch { found = {} }
+      if (found.cid) break
+      await sleep(4000)
+    }
+  }
+  const mentionKept = Array.isArray(found.text_extra)
+    ? found.text_extra.some((e) => String(e && e.sec_uid || '').length > 8)
+    : undefined
   c.close()
   await sleep(200)   // 等 WebSocket 真正关掉再退出（别的工具踩过 libuv 断言）
-  out({ ok: true, published: true, aweme_id: AWEME, mention: NAME, ...(replyInfo || {}), popup_row: row, editor_html: editorHtml, editor_after: editorAfter, chrome: chromed })
+
+  if (sc !== null && sc !== 0) {
+    out({ ok: false, published: false, aweme_id: AWEME, mention: NAME, status_code: sc, status_msg: serverMsg, editor_after: editorAfter, replies: pubs.length })
+    process.exit(2)
+  }
+  if (!cleared) {
+    if (verifyState.need) {
+      out({
+        ok: false, published: false, verification_required: true, phone_hint: verifyState.phone || '',
+        error: '评论区发布要过一次短信验证（抖音风控：接收短信验证码 / 为确保是本人操作抖音账号）—— 验证没过之前评论不会入库',
+        hint: '跑一次：node tools/comment-verify.mjs --aweme <id> --request-code（让它发码），拿到码后 --code <6位>；过了之后这条 UI 路径就能真 @ 了，而且长期有效',
+        editor_after: editorAfter, replies: pubs.length, pub_status: lastPub.status, pub_raw: String(lastPub.body || '').slice(0, 300),
+      })
+      process.exit(3)
+    }
+    out({ ok: false, published: false, error: '点了发布但输入框没清空 —— 服务端很可能没收录（以前就是这样假成功的）', status_code: sc, status_msg: serverMsg, editor_after: editorAfter, replies: pubs.length, pub_status: lastPub.status, pub_raw: String(lastPub.body || '').slice(0, 300) })
+    process.exit(2)
+  }
+  out({
+    ok: true, published: true, verified: 'editor_cleared', status_code: sc,
+    cid: String(found.cid || cid || '') || undefined,
+    found_text: found.text || undefined,
+    text_extra: found.text_extra || undefined,
+    mention_kept: mentionKept,
+    aweme_id: AWEME, mention: NAME, ...(replyInfo || {}), popup_row: row, editor_html: editorHtml, editor_after: editorAfter, chrome: chromed,
+  })
 } catch (e) {
   if (!(e && e.__done)) out({ ok: false, error: String(e?.message ?? e) })
 }

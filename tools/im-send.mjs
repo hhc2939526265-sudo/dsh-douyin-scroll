@@ -6,10 +6,10 @@
  * 我们只做三件事：点开会话 → 粘正文 → 回车。
  *
  * 用法：
- *   node tools/im-send.mjs --to 主示例好友主 --text 主你好主
- *   node tools/im-send.mjs --to 主示例好友主 --file <txt路径>
- *   node tools/im-send.mjs --to 主示例好友主 --file x.txt --dry   # 只验证不发送
- *   node tools/im-send.mjs --to 主示例好友主 --read               # 只读：把会话读出来（带「谁发的」）
+ *   node tools/im-send.mjs --to "示例好友" --text "你好"
+ *   node tools/im-send.mjs --to "示例好友" --file <txt路径>
+ *   node tools/im-send.mjs --to "示例好友" --file x.txt --dry   # 只验证不发送
+ *   node tools/im-send.mjs --to "示例好友" --read               # 只读：把会话读出来（带「谁发的」）
  *
  * 输出：一行 JSON
  *   发送：{ok, sent, to, len, readback, my_msg_before, my_msg_after, newest_from, msgs_sample, …}
@@ -20,7 +20,7 @@
  * ============================================================================
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -62,7 +62,7 @@ const bodyText = async (ev) => (await ev(`(document.body?document.body.innerText
  *
  * ── 两个坑 ────────────────────────────────────────────────────────────────
  *   1. 同一人连发几条时，**只有组里最早那条带头像**，后面几条没有
- *      ⇒ 从旧往新扫，缺的继承上一条（不是主下一条主）
+ *      ⇒ 从旧往新扫，缺的继承上一条（不是"下一条"）
  *   2. DOM 顺序是「新的在上」、视觉是「旧的在上」（容器是 column-reverse）
  *      ⇒ 必须**倒着遍历**才能让继承方向正确
  *   3. 一条都扫不到头像（比如最顶上被裁掉的那条）⇒ 给 `unknown`，**不猜**
@@ -71,14 +71,14 @@ const bodyText = async (ev) => (await ev(`(document.body?document.body.innerText
  */
 const readMessages = async (ev) => {
   const raw = await ev(`(function(){
-    var listNode = document.querySelector('[class*=主messageMessageList主]')
-      || document.querySelector('[class*=主componentsRightPanel主]') || document.body;
+    var listNode = document.querySelector('[class*="messageMessageList"]')
+      || document.querySelector('[class*="componentsRightPanel"]') || document.body;
     var lb = listNode.getBoundingClientRect();
     var mid = lb.left + lb.width / 2;
-    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 主messageMessageBox主（outer / selectableRow / contentBox），
+    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 "messageMessageBox"（outer / selectableRow / contentBox），
     //    直接 querySelectorAll 会**一条算三条** ⇒ 用 **对象引用** 去重（同一层消息被多个节点共享同一个
     //    message 对象）。别用位置去重：三层节点的 top 差几个像素，会漏掉。
-    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*=主messageMessageBox主]'));
+    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*="messageMessageBox"]'));
     var out = [], seenObj = new WeakSet();
     nodes.forEach(function(n){
       var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
@@ -133,7 +133,7 @@ const readMessages = async (ev) => {
 }
 
 const hasEditor = async (ev) => await ev(`(function(){
-  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
+  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
   return eds.some(function(e){var r=e.getBoundingClientRect(); return r.width>80 && r.height>10;});
 })()`)
 
@@ -144,7 +144,7 @@ const hasEditor = async (ev) => await ev(`(function(){
  */
 const listConversations = (ev) => ev(`(function(){
   var out = [];
-  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
   nodes.forEach(function(n){
     var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
     var sec = '';
@@ -168,24 +168,24 @@ const listConversations = (ev) => ev(`(function(){
     /**
      * ⭐ 昵称要**单独取**，不能拿整段 text 去掉重。
      *    text 是「昵称 时间 最后一句话」，用 text.includes(who) 会把
-     *    主别人最后一句话里出现的词主 当成那个人 —— 实测：
+     *    "别人最后一句话里出现的词" 当成那个人 —— 实测：
      *    用「大肥鱼」当收件人（没有任何人叫这个名字），会匹配到 3 个人。
      *    这里给两个候选：昵称元素里的文本 → 没有就退回第一段。
      */
-    var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+    var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="nickname"], [class*="Nickname"]');
     var nick = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : '';
     if (!nick) nick = t.split(' ')[0] || '';
     /**
-     * ⚠️ 左侧面板有**两个列表**：主会话列表 和 「陌生人消息」列表。
+     * ⚠️ 左侧面板有**两个列表**："会话列表 和 「陌生人消息」列表。
      *    当前激活哪个，另一个的项仍然在 DOM 里，但被横向平移到屏外（left 为负）。
-     *    实测：陌生人面板开着时，主列表里私信对象那条 left=-303 ⇒ 点它毫无反应。
+     *    实测：陌生人面板开着时，"列表里私信对象那条 left=-303 ⇒ 点它毫无反应。
      *    ⇒ 把 in_view 一起报上去，让调用方知道这个坐标点不到。
      */
     var inView = r.left >= 0 && r.top >= 0 && r.right <= window.innerWidth && r.bottom <= window.innerHeight;
     /**
-     * ⭐ 这条属于哪个列表：'main'（主会话列表）/ 'stranger'（陌生人消息）/ ''
+     * ⭐ 这条属于哪个列表：'main'（"会话列表）/ 'stranger'（陌生人消息）/ ''
      *    两个列表在同一块区域里横向滑动，非激活的会被平移到屏外（left 为负）。
-     *    知道归属才能主切过去主，光靠 scrollIntoView 救不回来（那是横向平移，不是滚动）。
+     *    知道归属才能"切过去"，光靠 scrollIntoView 救不回来（那是横向平移，不是滚动）。
      *    ⚠️ 判定顺序不能反：陌生人列表的 class 里**同时**含
      *       StrangerConversationList 和 ConversationList，必须先判 stranger。
      */
@@ -211,7 +211,7 @@ const listConversations = (ev) => ev(`(function(){
   return JSON.stringify(out);
 })()`)
 
-/** 从会话项文本里猜昵称（第一段；主示例好友 12:12 最后一句话主 → 主示例好友主） */
+/** 从会话项文本里猜昵称（第一段；"示例好友 12:12 最后一句话" → "示例好友"） */
 const nickOf = (text) => String(text || '').split(/\s+/)[0] || ''
 
 /** 读「当前打开的这个会话」的对端 sec_uid —— 用来校验身份（不同层级包法不一样，多试几种） */
@@ -227,7 +227,7 @@ const currentConvId = (ev) => ev(`(function(){
     for (var i = 0; i < cands.length; i++) if (cands[i]) return String(cands[i]);
     return '';
   }
-  var node = document.querySelector('[class*=主messageMessageBox主]') || document.querySelector('[data-e2e=主msg-item-content主]');
+  var node = document.querySelector('[class*="messageMessageBox"]') || document.querySelector('[data-e2e="msg-item-content"]');
   if (!node) return '';
   var fk = Object.keys(node).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
   if (!fk) return '';
@@ -241,13 +241,13 @@ const currentConvId = (ev) => ev(`(function(){
 })()`)
 
 /**
- * ⭐ 等会话列表真的渲染出来（**别拿主URL 已经是 /chat主当加载完成**）。
+ * ⭐ 等会话列表真的渲染出来（**别拿"URL 已经是 /chat"当加载完成**）。
  *
  * 🔴 2026-10-23 实测踩到的坑：
  *    冷启动（无头 Chrome 刚起来）时 `location.href` 可能**已经是 /chat**，
  *    于是原来那句 `if (!url.includes('/chat')) { navigate; sleep(5000) }` 被跳过，
  *    紧接着就去 listConversations —— 此时列表还没渲染，`querySelectorAll` 返回 **0 个**，
- *    或者只返回几个 —— 于是主找不到人主，报成 `not-found`。
+ *    或者只返回几个 —— 于是"找不到人"，报成 `not-found`。
  *    实测：冷启动后 `--read 枫眠` 直接失败，candidates 里只有 1 个人（应该有 14 个）。
  *
  * 所以：**轮询等列表出现**，并在拿到第一次之后再多等一会儿让它稳定（虚拟列表会分批渲染）。
@@ -258,9 +258,9 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
   let last = 0
   let stable = 0
   while (Date.now() - t0 < timeoutMs) {
-    const n = Number(await ev(`document.querySelectorAll('[data-e2e=主conversation-item主]').length`)) || 0
+    const n = Number(await ev(`document.querySelectorAll('[data-e2e="conversation-item"]').length`)) || 0
     if (n > 0) {
-      // 拿到之后就等它主不再变多主，避免只渲染了一部分就往下走
+      // 拿到之后就等它"不再变多"，避免只渲染了一部分就往下走
       if (n === last) stable++
       else { stable = 0; last = n }
       if (stable >= 2) return n
@@ -288,34 +288,34 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
  *            并把**当前那个人的 sec_uid** 当成你要找的人 —— 于是消息发进别人的对话框，
  *            而返回值里 `to` 写的是你要发的那个人。**调用方完全看不出错。**
  *      实测：界面开着「枫眠」，`--to 某帅气用户`（只给昵称）⇒
- *            ok:true, to:主某帅气用户主, to_sec_uid: 枫眠的 id。
- *      ⇒ 现在：**只看右栏头部**（真正表示主当前对端主的那一小块），且必须与昵称**精确相等**；
+ *            ok:true, to:"某帅气用户", to_sec_uid: 枫眠的 id。
+ *      ⇒ 现在：**只看右栏头部**（真正表示"当前对端"的那一小块），且必须与昵称**精确相等**；
  *              对不上就老老实实去列表里点。
  *
  *   ② 【昵称用 includes 匹配】
- *      原来 `list.filter(c => c.text.includes(who))`，text 里含主最后一句话主。
+ *      原来 `list.filter(c => c.text.includes(who))`，text 里含"最后一句话"。
  *      实测：用「大肥鱼」当收件人（没有任何人叫这个名字）会匹配到 3 个人，
  *            最后发给「哈基米斯基」。用「你好」会匹配到 6 个。
  *      ⇒ 现在：**先比 nick 是否相等**，再用 text 兜底（并标注 matched_by）。
  *
  *   ③ 【屏外元素点不到，却报成功】
- *      左侧面板有两个列表（主列表 / 陌生人消息）。非激活的那个被横向平移到屏外。
- *      实测：陌生人面板开着时，主列表里私信对象那条 left=-303，
+ *      左侧面板有两个列表（"列表 / 陌生人消息）。非激活的那个被横向平移到屏外。
+ *      实测：陌生人面板开着时，"列表里私信对象那条 left=-303，
  *            派发 mousePressed 到 x=-156 **毫无反应、也不报错**，
  *            点完右栏还是原来那个人 ⇒ 后续 acCurrentConvId 校验用的是旧会话……
- *      最坏情况是主看起来切换了、其实没切主。
+ *      最坏情况是"看起来切换了、其实没切"。
  *      ⇒ 现在：点击前先要求 `in_view`；不在可视区**先把它滚进可视区**，滚不进来就
  *              返回 `status:'offscreen'` —— 明确失败，不假装成功。
  */
 async function openConversation(ev, send, who, whoId) {
   /**
-   * ⭐ 判断主当前会话是不是就是他主要用**右栏头部**，不是 bodyText。
-   *    右栏头部 = `[class*=主componentsRightPanel主]` 的第一行文本，那才是对端昵称。
+   * ⭐ 判断"当前会话是不是就是他"要用**右栏头部**，不是 bodyText。
+   *    右栏头部 = `[class*="componentsRightPanel"]` 的第一行文本，那才是对端昵称。
    *    （bodyText 含左侧列表，任何人都在里面 —— 那正是 bug ① 的根源）
    */
   const currentWho = async () => {
     const nick = String(await ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -333,7 +333,7 @@ async function openConversation(ev, send, who, whoId) {
     } else if (who) {
       /**
        * ⭐ 只有昵称时的判据：右栏头部**精确等于**昵称才算已打开。
-       *    ⚠️ 不要用 includes：昵称 主拣主 是 主拣东西主 的前缀；而且这里以前是整个 bodyText。
+       *    ⚠️ 不要用 includes：昵称 "拣" 是 "拣东西" 的前缀；而且这里以前是整个 bodyText。
        */
       if (cur.nick && cur.nick === who && cur.id) {
         return { status: 'already-open', matched: { sec_uid: cur.id, nick: cur.nick } }
@@ -359,13 +359,13 @@ async function openConversation(ev, send, who, whoId) {
     /**
      * 🔴 三级匹配，**越往后越保守**（2026-10-23 重做）：
      *   ① 昵称**完全相等**      → 直接用
-     *   ② 昵称**以输入开头**    → 允许（主某帅气主 → 主某帅气用户主），仍算唯一命中才用
-     *   ③ 整段 text 包含        → ❌ **不再自动采用**，只当作主你可能想找主的提示
+     *   ② 昵称**以输入开头**    → 允许（"某帅气" → "某帅气用户"），仍算唯一命中才用
+     *   ③ 整段 text 包含        → ❌ **不再自动采用**，只当作"你可能想找"的提示
      *
      *    为什么砍掉 ③：
      *      text 是「昵称 时间 最后一句话」。用「大肥鱼」当收件人时会命中 3 个人
-     *      （哈基米斯基 / zPz / 拣 —— 因为他们的**最后一句话**里都有主大肥鱼主），
-     *      报错还写成主有多个同名的人主，让人以为真的有 3 个同名。
+     *      （哈基米斯基 / zPz / 拣 —— 因为他们的**最后一句话**里都有"大肥鱼"），
+     *      报错还写成"有多个同名的人"，让人以为真的有 3 个同名。
      *      实测确认过：一个叫「大肥鱼」的都没有。
      *      ⇒ 找不到就叫找不到，别拿别人的话当名字。
      */
@@ -387,7 +387,7 @@ async function openConversation(ev, send, who, whoId) {
   if (!hits.length) {
     return {
       status: 'not-found', matched: null, matched_by: how,
-      /** ⭐ 模糊候选单独放，明确标注主没有一个人叫这个名字主 */
+      /** ⭐ 模糊候选单独放，明确标注"没有一个人叫这个名字" */
       near_misses: nearMisses.map((c) => ({ sec_uid: c.sec_uid, nick: c.nick, unread: c.unread })),
       hint: nearMisses.length
         ? `没有任何人的昵称是「${who}」。`
@@ -412,12 +412,12 @@ async function openConversation(ev, send, who, whoId) {
   /**
    * ⭐ 点击前先把它**弄到可视区里**。
    *
-   *    左侧面板有两个列表（主会话列表 / 「陌生人消息」），它们在同一块区域里
+   *    左侧面板有两个列表（"会话列表 / 「陌生人消息」），它们在同一块区域里
    *    **横向滑动**：非激活的那个被平移到屏外（left 为负）。
    *    对屏外坐标派发 mousePressed **没有任何反应、也不报错** —— 点了等于白点。
    *
    *    救法有两层（顺序不能反）：
-   *      ① 它在主另一个列表主里 ⇒ 先点那个面板的返回箭头/入口，把面板切过去
+   *      ① 它在"另一个列表"里 ⇒ 先点那个面板的返回箭头/入口，把面板切过去
    *      ② 只是滚出了纵向可视区 ⇒ scrollIntoView
    *    两层都救不回来 ⇒ 返回 offscreen，**明确失败，不假装成功**。
    *
@@ -429,7 +429,7 @@ async function openConversation(ev, send, who, whoId) {
     const want = b.panel || 'main'
     // ① 切列表：目标在 main、但当前屏外 ⇒ 点「返回」箭头退出陌生人面板
     if (want === 'main') {
-      const hasStrangerTitle = await ev(`!!document.querySelector('[class*=主StrangerConversationListtitle主]')`)
+      const hasStrangerTitle = await ev(`!!document.querySelector('[class*="StrangerConversationListtitle"]')`)
       if (hasStrangerTitle) {
         const back = JSON.parse(String(await ev(`(function(){
           var best = null;
@@ -477,14 +477,14 @@ async function openConversation(ev, send, who, whoId) {
     const rescanned = JSON.parse(String(await ev(`(function(){
       var want = ${JSON.stringify(String(b.nick || ''))};
       var wantSec = ${JSON.stringify(String(b.sec_uid || ''))};
-      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         var keys = Object.keys(n), fk = null;
         for (var k = 0; k < keys.length; k++) if (keys[k].indexOf('__reactFiber$') === 0) { fk = keys[k]; break }
         var sec = '';
         if (fk) { var f = n[fk], d = 0; while (f && d < 14) { var p = f.memoizedProps; if (p && p.conversation && p.conversation.toParticipantSecUserId) { sec = String(p.conversation.toParticipantSecUserId); break } f = f.return; d++; } }
-        var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+        var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="nickname"], [class*="Nickname"]');
         var nk = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : ((n.innerText || '').replace(/\\s+/g, ' ').trim().split(' ')[0] || '');
         if (wantSec ? sec !== wantSec : nk !== want) continue;
         var r = n.getBoundingClientRect();
@@ -517,7 +517,7 @@ async function openConversation(ev, send, who, whoId) {
    * 点完再核对一次：开着的是不是真的是他。
    * ⚠️ 两个判据都要过：
    *    · 有 whoId ⇒ 对端 id 必须相等
-   *    · 只有昵称 ⇒ 右栏头部必须**精确等于**昵称（这是防主点了没反应还报成功主的兜底）
+   *    · 只有昵称 ⇒ 右栏头部必须**精确等于**昵称（这是防"点了没反应还报成功"的兜底）
    */
   const after = await currentWho()
   if (whoId && after.id && after.id !== whoId) {
@@ -579,7 +579,7 @@ async function main() {
         count: people.length,
         people,
         no_id_count: people.filter((p) => !p.has_id).length,
-        /** ⭐ 未读总数 / 有未读的人数 —— 这才是主谁找过我主的可靠信号 */
+        /** ⭐ 未读总数 / 有未读的人数 —— 这才是"谁找过我"的可靠信号 */
         unread_total: unreadTotal,
         unread_people: people.filter((p) => p.unread > 0).length,
         offscreen_count: people.filter((p) => !p.in_view).length,
@@ -592,7 +592,9 @@ async function main() {
     } finally { c.close() }
   }
 
-  const text = FILE ? readFileSync(FILE, 'utf8').trim() : String(TEXT || '').trim()
+  const text = (FILE ? readFileSync(FILE, 'utf8').trim() : String(TEXT || '').trim())
+  // ⚠️ 2026-10-25 老大两次抱怨「——」像 AI ⇒ 最后一道闸：真发出去之前把破折号换成逗号
+  .replace(/\s*——\s*/g, '，').replace(/\s*--+\s*/g, '，').replace(/，{2,}/g, '，')
   if (!READ) {
     if (!text && !IMAGE) return out({ ok: false, error: '没有正文（用 --text / --file），或用 --image 发图片表情' })
     if (text && text.length > 1800) return out({ ok: false, error: `正文太长（${text.length} 字），抖音信信放不下，拆开发` })
@@ -607,7 +609,16 @@ async function main() {
       await c.send('Page.navigate', { url: 'https://www.douyin.com/chat' })
       await sleep(5000)
     }
-    const opened = await openConversation(c.ev, c.send, TO, TOID)
+    let opened = await openConversation(c.ev, c.send, TO, TOID)
+    // ⭐ 2026-10-25 本机修复：复用页面 / 冷启动时会话列表常常第一次一条都不渲染（waitList 超时），
+    //    以前直接报「会话列表没加载出来（可能还没登录）」。现在强制重新导航再等，最多再来两轮。
+    if (opened.status === 'no-list') {
+      for (let tryI = 0; tryI < 2 && opened.status === 'no-list'; tryI++) {
+        await c.send('Page.navigate', { url: 'https://www.douyin.com/chat' })
+        await sleep(4000)
+        opened = await openConversation(c.ev, c.send, TO, TOID)
+      }
+    }
     if (opened.status === 'ambiguous') {
       return out({
         ok: false, error: '会话列表里有多个同名的人，不敢猜（猜错就是把信信发给陌生人）',
@@ -628,7 +639,7 @@ async function main() {
       return out({
         ok: false,
         error: opened.hint || (TOID ? `会话列表里没有 sec_uid=${TOID} 这个人` : `在会话列表里没找到「${TO}」`),
-        // ⚠️ near_misses 是主最后一句话里碰巧出现这几个字主的人，**不是**候选收件人
+        // ⚠️ near_misses 是"最后一句话里碰巧出现这几个字"的人，**不是**候选收件人
         near_misses: opened.near_misses || [],
         candidates: opened.candidates || [], chrome: chromed,
       })
@@ -647,7 +658,7 @@ async function main() {
         ok: true, mode: 'read', read_only: true,
         to: target.nick, to_sec_uid: target.sec_uid || undefined,
         matched_by: matchedBy,
-        // ⚠️ 明写出来：读的是主当前打开的会话主，而 to 是主认出来的人主——两者已经核过一致
+        // ⚠️ 明写出来：读的是"当前打开的会话"，而 to 是"认出来的人"——两者已经核过一致
         verified_open: true,
         count: msgs.length, mine: cnt('me'), them: cnt('them'), unknown: cnt('unknown'),
         sender_attribution: 'avatar-side（36px 头像落在列表左/右半边；unknown = 该组没有头像可继承）',
@@ -663,16 +674,17 @@ async function main() {
 
     const before = (await bodyText(c.ev)).length
     const beforeMsgs = await readMessages(c.ev)
-    if (DRY) return out({ ok: true, sent: false, dry: true, to: target.nick, to_sec_uid: target.sec_uid || undefined, len: text.length, matched_by: matchedBy, msgs_in_view: beforeMsgs.length, chrome: chromed })
+    // ⚠️ 有 --image 时不能在这里早退：图片模式自己的 dry 分支在下面（要验上传入口+预览）
+    if (DRY && !IMAGE) return out({ ok: true, sent: false, dry: true, to: target.nick, to_sec_uid: target.sec_uid || undefined, len: text.length, matched_by: matchedBy, msgs_in_view: beforeMsgs.length, chrome: chromed })
 
     /**
      * 🔴 打字前的最后一道身份核对（2026-10-23 加）。
-     *    前面 openConversation 已经核过一次，但主点输入框主这一步本身也可能
+     *    前面 openConversation 已经核过一次，但"点输入框"这一步本身也可能
      *    因为页面重渲染而落到别的会话上。**真发之前再确认右栏是不是他** ——
-     *    这一步很便宜（一次 evaluate），但它是主发错人主的最后一道闸。
+     *    这一步很便宜（一次 evaluate），但它是"发错人"的最后一道闸。
      */
     const gateNick = String(await c.ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -697,6 +709,8 @@ async function main() {
           var rr = nd.getBoundingClientRect();
           var im = Array.prototype.slice.call(nd.querySelectorAll('img')).filter(function(img){
             var b=img.getBoundingClientRect();
+            // 图片消息本体是 60-400px 的大图；28-48px 那种是头像（旧写法只认头像，永远数到 0）
+            if (b.width>=60 && b.height>=60) { var cy0=img.getBoundingClientRect().top+b.height/2; return cy0>=rr.top-2&&cy0<=rr.bottom+2; }
             if (b.width<28||b.width>48||Math.abs(b.width-b.height)>6) return false;
             var cy=img.getBoundingClientRect().top+b.height/2;
             return cy>=rr.top-2&&cy<=rr.bottom+2;
@@ -744,31 +758,73 @@ async function main() {
         if (DRY) return out({ ok:true, sent:false, dry:true, to:target.nick, has_uploader:true, preview,
           mime:up.mime, bytes:up.bytes, note:'dry：只验证图片入口与预览，未发送。', chrome:chromed })
         if (!preview) return out({ ok:false, sent:false, error:'图片塞进去了但没出现待发预览，没发送。', chrome:chromed })
+        // ⭐ 回读用「我发的图片/表情消息条数」——比按 28-48px 小图数（那是头像尺寸）靠谱：
+        //    图片消息渲染出来是 100-220px 的图，旧判据永远数不到，才出现"发了却报没发"
+        const countMyStickers = async () => (await readMessages(c.ev)).filter((m) => m.from === 'me' && m.sticker).length
         const beforeImg = await countMyImg()
-        // 点预览弹层"发送"按钮；找不到则回车
-        const btnInfo = JSON.parse(await c.ev(`(function(){
-          var r = document.querySelector('[class*="componentsRightPanel"]') || document.body;
-          var cands = Array.prototype.slice.call(r.querySelectorAll('div,button,span')).filter(function(el){
-            return (el.innerText||'').replace(/\\s+/g,'')==='发送' && el.getBoundingClientRect().width>30;
+        const beforeStk = await countMyStickers()
+        // 点弹层里的"发送"（图片上传后抖音会弹「发送给 <谁>」确认框，取消 / 发送 两个按钮）。
+        // ⚠️ 2026-10-25 踩坑：以前只找「发送」两个字的元素 + 立刻点，弹层还没出来 ⇒ 点到别处、
+        //    消息压根没发出去（截图里弹层还杵在那儿）。改成**轮询等弹层**、再点最靠下的那个「发送」。
+        const modalSendExpr = `(function(){
+          var all = Array.prototype.slice.call(document.querySelectorAll('div,button,span'));
+          var cands = all.filter(function(el){
+            if ((el.innerText||'').replace(/\\s+/g,'')!=='发送') return false;
+            var b=el.getBoundingClientRect();
+            if (b.width<40||b.height<20||b.top<0) return false;
+            return true;
           });
-          for (var i=0;i<cands.length;i++){ var b=cands[i].getBoundingClientRect(); if(b.left>=0&&b.top>=0) return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)}); }
-          return 'null';
-        })()`))
+          cands.sort(function(a,b){return b.getBoundingClientRect().top - a.getBoundingClientRect().top});
+          var el = cands[0]; if(!el) return 'null';
+          var b = el.getBoundingClientRect();
+          return JSON.stringify({x: Math.round(b.left+b.width/2), y: Math.round(b.top+b.height/2)});
+        })()`
+        let btnInfo = null
+        for (let i = 0; i < 24 && !btnInfo; i++) {
+          const raw = await c.ev(modalSendExpr)
+          if (raw && raw !== 'null') { try { btnInfo = JSON.parse(raw) } catch { btnInfo = null } }
+          if (!btnInfo) await sleep(500)
+        }
         if (btnInfo) {
-          await c.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:btnInfo.x,y:btnInfo.y,button:'none',buttons:0}); await sleep(120)
+          await c.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:btnInfo.x,y:btnInfo.y,button:'none',buttons:0}); await sleep(150)
           await c.send('Input.dispatchMouseEvent',{type:'mousePressed',x:btnInfo.x,y:btnInfo.y,button:'left',buttons:1,clickCount:1})
           await c.send('Input.dispatchMouseEvent',{type:'mouseReleased',x:btnInfo.x,y:btnInfo.y,button:'left',buttons:0,clickCount:1})
+          await sleep(1200)
+          // 弹层还在 ⇒ 再点一次（有时第一下被 hover 动画吃掉）
+          const still = await c.ev(modalSendExpr)
+          if (still && still !== 'null') {
+            try {
+              const b2 = JSON.parse(still)
+              await c.send('Input.dispatchMouseEvent',{type:'mousePressed',x:b2.x,y:b2.y,button:'left',buttons:1,clickCount:1})
+              await c.send('Input.dispatchMouseEvent',{type:'mouseReleased',x:b2.x,y:b2.y,button:'left',buttons:0,clickCount:1})
+            } catch { /* ignore */ }
+          }
         } else {
           await c.send('Input.dispatchKeyEvent',{type:'rawKeyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13})
           await c.send('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13})
         }
         await sleep(3000)
+        // 排障用：DOUYIN_SHOT=<png 路径> 时把点完发送之后的屏幕存一张（默认不存）
+        if (process.env.DOUYIN_SHOT) {
+          try {
+            const shot = await c.send('Page.captureScreenshot', { format: 'png' })
+            writeFileSync(process.env.DOUYIN_SHOT, Buffer.from(shot.data, 'base64'))
+          } catch { /* ignore */ }
+        }
+        // 图片上传要几秒：轮询最多 18 秒，等到「我发的表情/图片消息」多出一条
+        let afterStk = await countMyStickers()
+        for (let i = 0; i < 12 && !(afterStk > beforeStk); i++) {
+          await sleep(1500)
+          afterStk = await countMyStickers()
+        }
         const afterImg = await countMyImg()
-        const readback = afterImg > beforeImg
+        const readback = afterStk > beforeStk || afterImg > beforeImg
         return out({
           ok: readback, sent: readback, to:target.nick, to_sec_uid:target.sec_uid||undefined,
           image: IMAGE, mime: up.mime, matched_by: TOID ? 'sec_uid':'nickname(唯一)',
-          readback, my_images_before: beforeImg, my_images_after: afterImg, chrome: chromed,
+          readback, my_images_before: beforeImg, my_images_after: afterImg,
+          my_stickers_before: beforeStk, my_stickers_after: afterStk, chrome: chromed,
+          converted: up.converted || undefined,
           error: readback ? undefined : '发送动作点了，但回读没看到我发的图片消息（可能仍在上传/审核）—— 不等于没发，请人工看一眼。',
         })
       } finally {
@@ -776,55 +832,67 @@ async function main() {
       }
     }
 
-    // 点输入框
-    const pos = JSON.parse(await c.ev(`(function(){
-      var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
-      for (var i=0;i<eds.length;i++){var e=eds[i];var r=e.getBoundingClientRect();if(r.width>80&&r.height>10)return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});}
-      return '{}';
-    })()`))
-    await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1 })
-    await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1 })
-    await sleep(400)
-    await c.send('Input.insertText', { text })
-    await sleep(800)
+    // ⭐ 多段消息：正文里用**换行**分段，就一条条发出去（像真人连发几条）。
+    //    老大 2026-10-25 要求：「可以多段多句话，但不用每次都要」——
+    //    判断权在模型手里（prompt 里写了），工具只负责把它写的东西按段发出去。
+    const segs = text.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 5)
+    const sentSegs = []
+    for (let si = 0; si < segs.length; si++) {
+      const seg = segs[si]
+      // 点输入框
+      const pos = JSON.parse(await c.ev(`(function(){
+        var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
+        for (var i=0;i<eds.length;i++){var e=eds[i];var r=e.getBoundingClientRect();if(r.width>80&&r.height>10)return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});}
+        return '{}';
+      })()`))
+      await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1 })
+      await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1 })
+      await sleep(350)
+      await c.send('Input.insertText', { text: seg })
+      await sleep(600)
 
-    const typed = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
-      return e ? String(e.innerText||e.value||'').replace(/[\\u200b\\r]/g,'') : '';
-    })()`)
-    if (!String(typed).trim()) return out({ ok: false, error: '正文没进输入框（可能被风控拦截）', chrome: chromed })
+      const typed = await c.ev(`(function(){
+        var e=document.querySelector('[contenteditable="true"], textarea');
+        return e ? String(e.innerText||e.value||'').replace(/[\\u200b\\r]/g,'') : '';
+      })()`)
+      if (!String(typed).trim()) return out({ ok: false, sent: sentSegs.length > 0, segs_sent: sentSegs, error: '正文没进输入框（可能被风控拦截）', chrome: chromed })
 
-    await c.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-    await sleep(2600)
+      await c.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+      await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+      sentSegs.push(seg)
+      // 连发之间留 1.2–2.6 秒（太齐整反而像脚本）
+      if (si < segs.length - 1) await sleep(1200 + Math.floor(Math.random() * 1400))
+      else await sleep(2600)
+    }
 
     const bodyNow = await bodyText(c.ev)
     const leftInBox = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
+      var e=document.querySelector('[contenteditable="true"], textarea');
       return (e?String(e.innerText||e.value||''):'').replace(/[\\u200b\\s]/g,'').length;
     })()`)
     // ⭐ 第 ③ 步：**回读消息列表**，而且只数 `from === 'me'` 的
     //
-    // 2026-10-21 上半场还以为主读不出谁发的主，当时是错用了 `isMyMessage`（恒 true）。
+    // 2026-10-21 上半场还以为"读不出谁发的"，当时是错用了 `isMyMessage`（恒 true）。
     // 后来挖到头像左右这个判据，回读才算真的完整：
     //   「这段正文在**我发的**消息里从 N 条变成 N+1 条」—— 这才叫发成功了。
     // 如果光数总数，别人刚好发了同样的话就会假阳性。
     const afterMsgs = await readMessages(c.ev)
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim()
-    const sentText = norm(text)
-    const head = sentText.slice(0, 20)
+    const sentText = norm(sentSegs.join(' '))
+    const head = norm(sentSegs[0] || '').slice(0, 20)
     const isMine = (m) => m.from === 'me' && m.text
-      && (norm(m.text) === sentText || norm(m.text).startsWith(head))
+      && (sentSegs.some((s) => norm(m.text) === norm(s)) || (head && norm(m.text).startsWith(head)))
     const beforeCnt = beforeMsgs.filter(isMine).length
     const afterCnt = afterMsgs.filter(isMine).length
     const readback = afterCnt > beforeCnt
     // 列表里最新那条是谁发的（我发完，这里应该翻成 'me'）
     const newest = afterMsgs[0] || null
     // 页面上出现过（弱证据，留作参考）
-    const appeared = String(bodyNow).replace(/\s+/g, ' ').includes(text.replace(/\s+/g, ' ').slice(0, 24))
+    const appeared = String(bodyNow).replace(/\s+/g, ' ').includes(String(sentSegs[0] || '').replace(/\s+/g, ' ').slice(0, 24))
     const ok = Number(leftInBox) === 0 && readback
     return out({
       ok, sent: ok, to: target.nick, to_sec_uid: target.sec_uid || undefined, len: text.length,
+      segs: sentSegs.length, segs_sent: sentSegs,
       matched_by: TOID ? 'sec_uid' : 'nickname(唯一)',
       from: before, to_len: String(bodyNow).length, clicked: opened.status, chrome: chromed,
       // ⭐ 回读证据（只数我发的）

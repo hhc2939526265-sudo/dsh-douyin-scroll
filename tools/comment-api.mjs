@@ -31,7 +31,10 @@
  *
  * 输出一行 JSON：{ ok, http, cid, reply_to, root, text, raw?, error? }
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { channelsOf, markChannel } from '../lib/channels.mjs'
 import { openPage, sleep } from '../lib/chrome.mjs'
 
 const argv = process.argv.slice(2)
@@ -41,7 +44,9 @@ const AWEME = String(argOf('--aweme', '')).trim()
 const REPLY = String(argOf('--reply', '')).trim()
 const ROOT = String(argOf('--root', '')).trim()
 const FILE = String(argOf('--file', '')).trim()
-const TEXT = FILE ? readFileSync(FILE, 'utf8').trim() : String(argOf('--text', '')).trim()
+let TEXT = (FILE ? readFileSync(FILE, 'utf8').trim() : String(argOf('--text', '')).trim())
+  // ⚠️ 2026-10-25 老大抱怨「——」像 AI 写的 ⇒ 最后一道闸：评论发出去之前统一换成逗号
+  .replace(/\s*——\s*/g, '，').replace(/\s*--+\s*/g, '，').replace(/，{2,}/g, '，')
 // ⭐ v0.4.0 贴纸评论：传平台贴纸 id（表情库 sticker_id）；此时 text 可留空（贴纸即内容）
 const STICKER = String(argOf('--sticker', '')).trim()
 
@@ -64,17 +69,107 @@ const wantsMention = Boolean(MENTION.name || MENTION.uid || MENTION.secUid)
 const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode = o.ok ? 0 : 1 }
 
 if (!AWEME) { out({ ok: false, error: '缺 --aweme' }); process.exit(1) }
-if (!TEXT && !STICKER) { out({ ok: false, error: '正文是空的' }); process.exit(1) }
-if (TEXT.length > 500) { out({ ok: false, error: `正文太长（${TEXT.length} 字），抖音评论放不下` }); process.exit(1) }
-if (wantsMention) {
+if (!TEXT && !STICKER) { out({ ok: false, error: '正文是空的' }) }
+if (TEXT.length > 500) { out({ ok: false, error: `正文太长（${TEXT.length} 字），抖音评论放不下` }) }
+
+/**
+ * ⭐⭐ 2026-10-25 重做「真 @」：不再直接拒绝。
+ *
+ *    以前这里拒绝的理由是「API 直发服务端会剥掉 sec_uid」，但那次**没带 text_extra**
+ *    （body 里写死 `text_extra: '[]'`）——服务端看到的只是一串 "@昵称" 文字，当然没有实体，
+ *    当然不发通知。前端点选 @ 时提交的正是 text_extra：
+ *      [{ user_id, sec_uid, type: 0, start: 0, end: <"@昵称" 的长度> }]
+ *    ⇒ 这里改成：只要给了 uid + sec_uid，且正文确实以 "@昵称" 开头，就把同样的 text_extra 带上。
+ *    能不能被服务端保住，由**回读**（ins_ids 读回该条评论的 text_extra）来验证，不靠猜。
+ */
+/**
+ * ⭐ 2026-10-29：正文没写「@昵称」就**自动补**上。
+ *    这轮实测到一次「len=28 刚好等于正文长度、没有 mention_verified」—— 就是模型没自己写 @，
+ *    而 mentionReady 要求 TEXT.startsWith('@') ⇒ 静默退化成普通评论。
+ *    既然调用方已经把 sec_uid 给了、也说了要 @ 谁，前缀由脚本补齐更靠谱。
+ */
+let TEXTX = TEXT
+if (wantsMention && MENTION.secUid && MENTION.name && !TEXTX.startsWith('@')) {
+  TEXTX = '@' + MENTION.name + ' ' + TEXTX
+}
+TEXT = TEXTX
+const mentionReady = Boolean(MENTION.secUid && TEXT.startsWith('@'))
+if (wantsMention && !mentionReady) {
   out({
     ok: false,
     unsupported: 'mention',
-    error: '这个脚本做不了真 @（API 直发会被服务端剥掉 sec_uid：名字变蓝但点开是空页、对方收不到通知）',
-    use_instead: 'tools/comment-mention-ui.mjs --aweme <id> --name <昵称> --text <正文>',
-    hint: '想发"@ 只是文字"的普通评论：去掉 --mention-* 三个参数再调',
+    error: '要真 @ 必须给 --mention-secuid，且正文以「@昵称」开头（--mention-uid 可省，会按 sec_uid 反查）',
+    hint: '例：--text 「@墨時秋  老大，这猫劈纸太认真了」 --mention-secuid MS4wLjABAAAA…',
   })
   process.exit(1)
+}
+const MENTION_END = mentionReady
+  ? (TEXT.search(/\s/) > 0 ? TEXT.search(/\s/) : TEXT.length)
+  : 0
+
+/**
+ * ⭐ 2026-10-26 老大：「回复的内容有些相似，需要注意不要一直重复」
+ *    ⇒ 同一栋楼（楼根）最多回 2 次；新回复跟这楼里最近几条太像（字符 bigram 重合率 > 0.62）就拦。
+ *    记录写 `<HOME>/reply-threads.json`，键 `aweme:楼根`。**放在这里**是因为宿主工具和 MCP 值班轮
+ *    最终都走这个脚本 —— 一处上锁，两条路都受管。
+ *    要强行覆盖：`DOUYIN_FORCE_REPLY=1`（宿主工具是 force:true）。
+ */
+const DUTY_HOME = process.env.DOUYIN_HOME || process.env.DOUYIN_DUTY_HOME || join(homedir(), '.dsh', 'douyin-duty')
+const threadsFile = join(DUTY_HOME, 'reply-threads.json')
+const loadThreads = () => { try { return JSON.parse(readFileSync(threadsFile, 'utf8')) || {} } catch { return {} } }
+const saveThreads = (o) => { try { writeFileSync(threadsFile, JSON.stringify(o, null, 1), 'utf8') } catch { /* 记不上不影响发 */ } }
+const bigramsOf = (s) => {
+  const t = String(s || '').replace(/[\s\p{P}\p{S}]/gu, '')
+  const g = new Set()
+  for (let i = 0; i < t.length - 1; i++) g.add(t.slice(i, i + 2))
+  return g
+}
+const simOf = (a, b) => {
+  const A = bigramsOf(a); const B = bigramsOf(b)
+  if (!A.size || !B.size) return 0
+  let n = 0
+  for (const x of A) if (B.has(x)) n++
+  return n / Math.min(A.size, B.size)
+}
+const threadKeyOf = (root) => `${AWEME}:${root || REPLY}`
+
+if (REPLY && !DRY && process.env.DOUYIN_FORCE_REPLY !== '1') {
+  const th = loadThreads()[threadKeyOf(ROOT)]
+  if (th) {
+    const n = Number(th.n || 0)
+    if (n >= 2) {
+      out({
+        ok: false, blocked: 'already_replied', aweme_id: AWEME, reply_to: REPLY, root: ROOT || undefined,
+        times_in_thread: n,
+        error: `这栋楼已经回过 ${n} 次了 —— 别追着同一条刷，他真想聊会再找你`,
+        hint: '换别的视频、或等他再说话；确实要再补一句就设 DOUYIN_FORCE_REPLY=1。',
+      })
+      process.exit(1)
+    }
+    const near = (th.texts || []).slice(-4).find((t) => simOf(t, TEXT) > 0.62)
+    if (near) {
+      out({
+        ok: false, blocked: 'too_similar', aweme_id: AWEME, reply_to: REPLY,
+        similar_to: near,
+        error: `这句跟你刚在这栋楼里说过的话太像了：「${String(near).slice(0, 40)}…」`,
+        hint: '换个说法，或者干脆别再说 —— 没新话就停手才像人。',
+      })
+      process.exit(1)
+    }
+  }
+}
+const markThread = () => {
+  if (!REPLY) return
+  const all = loadThreads()
+  const k = threadKeyOf(ROOT)
+  const th = all[k] || { n: 0, texts: [] }
+  th.n = Number(th.n || 0) + 1
+  th.texts = [...(th.texts || []), String(TEXT || '').slice(0, 200)].slice(-6)
+  th.at = new Date().toISOString()
+  all[k] = th
+  const keys = Object.keys(all)
+  if (keys.length > 300) for (const kk of keys.slice(0, keys.length - 300)) delete all[kk]
+  saveThreads(all)
 }
 
 try {
@@ -198,6 +293,28 @@ try {
     var ROOT = ${JSON.stringify(plan.root || '')};
     var REPLYTO = ${JSON.stringify(plan.reply_to || '')};
     var TEXT = ${JSON.stringify(TEXT)};
+    // ⭐ 2026-10-25 修：STICKER 是 Node 侧的变量，没注入进页面 ⇒ 页面里 ReferenceError: STICKER is not defined
+    //    （于是**每一次**发评论 / 回复都直接失败，看着像「评论区 @ 不了老大」）
+    var STICKER = ${JSON.stringify(STICKER)};
+    // ⭐ 真 @：uid 没给就按 sec_uid 反查一次（服务端要 user_id + sec_uid 都在 text_extra 里）
+    var MUID = ${JSON.stringify(MENTION.uid)};
+    var MSEC = ${JSON.stringify(MENTION.secUid)};
+    var MEND = ${JSON.stringify(MENTION_END)};
+    if (MSEC && !MUID) {
+      try {
+        var pu = '/aweme/v1/web/user/profile/other/?device_platform=webapp&aid=6383&sec_user_id=' + encodeURIComponent(MSEC);
+        var pr = await fetch(pu, { credentials: 'include' });
+        var pj = JSON.parse(await pr.text());
+        MUID = String((pj && pj.user && pj.user.uid) || '');
+      } catch (e) { /* 查不到就退回"只是文字" */ }
+    }
+    /* ⭐ 2026-10-27：对照服务端**真保住**的样本（{"start":4,"end":7,"user_id":"1994962122842643","type":0,
+       "hashtag_name":"","hashtag_id":"","sec_uid":"MS4w…"}）—— user_id 必须是**字符串**，并且要带
+       hashtag_name / hashtag_id 两个空字段。少一项服务端就把整条 @ 丢掉（实测回读 text_extra: []，
+       评论里只剩纯文字「@墨時秋 …」，对方收不到任何通知 —— 老大反馈的"没艾特上"就是这个）。 */
+    var TEXTRA = (MUID && MSEC)
+      ? JSON.stringify([{ start: 0, end: MEND, user_id: String(MUID), type: 0, hashtag_name: '', hashtag_id: '', sec_uid: MSEC }])
+      : '[]';
     var COMMON = {
       device_platform:'webapp', aid:'6383', channel:'channel_pc_web',
       pc_client_type:'1', version_code:'190500', version_name:'19.5.0',
@@ -210,7 +327,7 @@ try {
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
     var url = '/aweme/v1/web/comment/publish/?' + qs(Object.assign({}, COMMON, { app_name:'aweme' }));
     var body = Object.assign({}, COMMON, {
-      aweme_id: AWEME, text: TEXT, text_extra: '[]',
+      aweme_id: AWEME, text: TEXT, text_extra: TEXTRA,
       aweme_type: '0', channel_id: '0', city: '', sticker_id: STICKER || '', is_fold: '0'
     });
     // ⭐ 只有回复场景才带这两个字段；而且**分工不同**
@@ -251,6 +368,31 @@ try {
      *   · 顶楼里读不到、但顶层列表里有它 ⇒ 它变成了一条独立顶层评论（**楼根填错了**）
      * 重读要等页面刷新一会儿，所以带 3 次重试。
      */
+    /**
+     * ⭐ 2026-10-25 加：**回读 mention 有没有被服务端保住**。
+     *    发了 @ 却回读不到 text_extra ⇒ 那只是纯文字，对方收不到通知，必须如实告诉调用方。
+     */
+    if (o.cid && MEND) {
+      for (var mAttempt = 1; mAttempt <= 3; mAttempt++) {
+        await new Promise(function(z){ setTimeout(z, mAttempt === 1 ? 1000 : 1500) });
+        var mj = await fetch('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+          aweme_id: AWEME, cursor: '0', count: '20', item_type: '0', insert_ids: o.cid
+        })), { credentials: 'include', headers: { accept: 'application/json' } }).then(function(x){ return x.text() }).catch(function(){ return '' });
+        var mjj = null; try { mjj = JSON.parse(mj) } catch(e) {}
+        var hit = null;
+        if (mjj && mjj.comments) {
+          for (var mi = 0; mi < mjj.comments.length; mi++) {
+            if (String(mjj.comments[mi].cid) === o.cid) { hit = mjj.comments[mi]; break; }
+          }
+        }
+        if (hit) {
+          var ex = hit.text_extra || [];
+          o.mention_kept = ex.some(function(e){ return e && String(e.sec_uid || '') !== '' });
+          o.mention_extra = JSON.stringify(ex).slice(0, 300);
+          break;
+        }
+      }
+    }
     if (o.cid && ROOT) {
       for (var attempt = 1; attempt <= 3; attempt++) {
         await new Promise(function(z){ setTimeout(z, attempt === 1 ? 1200 : 1800) });
@@ -330,6 +472,20 @@ try {
     }
   }
 
+  /* ⭐ 2026-10-26：真的发出去了才记账（同一楼最多 2 次的计数在这里 +1） */
+  if (ok) markThread()
+  /* ⭐ 2026-10-27：这条视频走「评论区 @」渠道记一笔；如果之前私信分享过，只给提示不拦。
+   *    ⚠️ 只有 @ 实体真保住了（mention_kept 不是 false）才算"通知到了他" ——
+   *    被平台剥掉的那种只是文字提及，不能记，否则以后想私信推这条会被 already_mentioned 拦掉。 */
+  let channelHint = ''
+  if (ok && mentionReady && res.mention_kept !== false) {
+    try { markChannel(AWEME, 'mention') } catch { /* 记不上不影响发 */ }
+  }
+  try {
+    const ch = channelsOf(AWEME)
+    if (mentionReady && ch.dm && !ch.mention) channelHint = '这条之前私信分享过 —— 一般不用再在评论区 @（老大说的：可以，但一般不这样做）；真有非说不可的再加。'
+  } catch { /* 读不到就算了 */ }
+
   out({
     ok,
     http: res.http,
@@ -343,6 +499,20 @@ try {
     server_reply_to_reply_id: res.rtt || undefined,
     /** ⭐⭐ 真正的核实结果（重读楼拿到的） */
     placement,
+    /** ⭐ 真 @ 的核实：true = 服务端保住了 sec_uid（对方能收到 @ 通知）；false = 只剩文字 */
+    mention_kept: res.mention_kept === undefined ? undefined : Boolean(res.mention_kept),
+    mention_extra: res.mention_extra || undefined,
+    /**
+     * ⭐ 2026-10-27：实测结论 —— **web 端发评论时，服务端会把 @ 实体整个丢掉**
+     *    （三种目标都试过：老大 / 视频作者 / 普通网友；关注后再试也不行；text_extra 回读恒为 []，
+     *     评论里只剩纯文字「@昵称 …」，对方收不到任何通知）。
+     *    ⇒ 这条路只能当「文字里提到他」，**别指望通知**；真要他收到，用私信卡片。
+     */
+    mention_dropped: mentionReady && ok && res.mention_kept === false ? true : undefined,
+    channel_hint: channelHint || undefined,
+    hint: (mentionReady && ok && res.mention_kept === false)
+      ? '平台这次没让 @ 生效（web 发评论时服务端把 mention 实体剥掉了）—— 他收不到 @ 通知；要让他看到就用 douyin_share_card 私信推一次。'
+      : undefined,
     aweme_id: AWEME,
     len: TEXT.length,
     chrome: chromed,

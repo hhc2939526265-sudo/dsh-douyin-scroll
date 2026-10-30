@@ -92,20 +92,20 @@ try {
   if (m5.facts.length === 2 && m5.facts.includes('在杭州') && m5.facts.includes('养了只橘猫')) ok('长期事实去重正确（2 条）')
   else bad(`事实不对：${JSON.stringify(m5.facts)}`)
 
-  /* ── 8. 上限：不能无限长 ── */
+  /* ── 8. 上限：不能无限长（2026-10-27 老大要求记忆更久 ⇒ 从 80 提到 400） ── */
   const many = []
-  for (let i = 0; i < 120; i++) many.push({ from: 'them', text: '第' + i + '条消息' })
+  for (let i = 0; i < 500; i++) many.push({ from: 'them', text: '第' + i + '条消息' })
   mergeDmMemory(home, SEC, '示例好友', many)
   const m6 = loadDmMemory(home, SEC)
-  if (m6.messages.length <= 80) ok(`记忆有上限（120 条塞进去，只留 ${m6.messages.length} 条 ≤ 80）`)
+  if (m6.messages.length <= 400) ok(`记忆有上限（500 条塞进去，只留 ${m6.messages.length} 条 ≤ 400）`)
   else bad(`记忆没上限：${m6.messages.length} 条`)
-  if (m6.messages[m6.messages.length - 1].text === '第119条消息') ok('留下的是最新的（不是最旧的）')
+  if (m6.messages[m6.messages.length - 1].text === '第499条消息') ok('留下的是最新的（不是最旧的）')
   else bad('截断方向错了 —— 留下了旧消息')
 
-  /* ── 9. 超长文本要截断 ── */
-  mergeDmMemory(home, SEC, '示例好友', [{ from: 'them', text: 'x'.repeat(500) }])
+  /* ── 9. 超长文本要截断（现在 400 字） ── */
+  mergeDmMemory(home, SEC, '示例好友', [{ from: 'them', text: 'x'.repeat(900) }])
   const m7 = loadDmMemory(home, SEC)
-  if (m7.messages[m7.messages.length - 1].text.length <= 200) ok('单条文本超长会截断（≤200 字）')
+  if (m7.messages[m7.messages.length - 1].text.length <= 400) ok('单条文本超长会截断（≤400 字）')
   else bad('超长文本没截断')
 
   /* ── 10. 评论区记忆 ── */

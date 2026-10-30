@@ -25,8 +25,25 @@ import urllib.parse
 import httpx
 
 HOME = home_str()
-PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
-NODE = r"C:\Program Files\nodejs\node.exe"
+PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _find_node():
+    """本机 node 不一定在 PATH，也不一定是 C:\\Program Files\\nodejs（DSH 自带一份）→ 逐个找。"""
+    import glob
+    import shutil
+    cands = [os.environ.get("DOUYIN_NODE") or "", os.environ.get("NODE_BIN") or "",
+             shutil.which("node") or "",
+             os.path.join(os.path.dirname(sys.executable), "node.exe"),
+             r"C:\Program Files\nodejs\node.exe"]
+    cands += sorted(glob.glob(os.path.expanduser(r"~\.dsh\dsh-runtimes\*\dependencies\node\bin\node.exe")))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return "node"
+
+
+NODE = _find_node()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 VENVPY = os.path.join(HOME, ".venv", "Scripts", "python.exe")
 GUARD = os.path.join(PLUGIN, "tools", "session-guard.py")
